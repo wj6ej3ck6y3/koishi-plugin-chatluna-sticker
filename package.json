@@ -1,22 +1,52 @@
 {
   "name": "koishi-plugin-chatluna-sticker",
-  "description": "chatluna擴展，給予了模型根據自身判斷收藏、發送表情的能力",
-  "version": "0.0.1",
+  "version": "1.1.1",
   "main": "lib/index.js",
-  "typings": "lib/index.d.ts",
+  "types": "lib/index.d.ts",
+  "type": "commonjs",
   "files": [
-    "lib",
-    "dist"
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+
+  "koishi": {
+    "description": {
+      "en": "Autonomous sticker sending and receiving: local image library, model automatically determines collection, in-memory pHash indexing",
+      "zh": "自主表情包收发：本地图片库、模型自動判断收藏、内存 pHash 索引"
+    },
+    "service": {
+      "required": [
+        "database",
+        "chatluna"
+      ]
+    },
+    "preview": false
+  },
+  "contributors": [
+    "wj6ej3ck6y3"
   ],
   "license": "MIT",
-  "scripts": {},
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "sticker",
+    "chatluna"
   ],
-  "devDependencies": {},
   "peerDependencies": {
-    "koishi": "4.18.11"
+    "koishi": "^4.17.0",
+    "koishi-plugin-chatluna": "^1.0.0"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "imghash": "^1.0.2",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "koishi": "^4.17.0",
+    "typescript": "^5.4.0"
   }
 }
