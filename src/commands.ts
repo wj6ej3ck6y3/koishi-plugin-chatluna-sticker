@@ -56,9 +56,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       if (!session) return
       const buf = await library.readImage(pHash)
       if (!buf) return '图片不存在'
-      await session.send(
-        h.image(`base64://${buf.toString('base64')}`)
-      )
+      await session.send(h.image(`data:image/png;base64,${buf.toString('base64')}`))
       return ''
     })
 
@@ -68,9 +66,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       if (!session) return
       const buf = await library.readImage(pHash)
       if (!buf) return '图片不存在'
-      await session.send(
-        h.image(`base64://${buf.toString('base64')}`)
-      )
+      await session.send(h.image(`data:image/png;base64,${buf.toString('base64')}`))
       await library.markUsed(pHash)
       return ''
     })

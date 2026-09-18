@@ -22,9 +22,6 @@ export function apply(ctx: Context, config: Config) {
   // 2. 图片库实例（含内存 pHash 索引）
   const library = new StickerLibrary(ctx, config)
 
-  // 3. 先绑定 session
-  tools.bindSession(ctx)
-
   // 4~6.
   middleware.apply(ctx, config, library)
   tools.apply(ctx, config, library)

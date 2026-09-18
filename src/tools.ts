@@ -1,34 +1,10 @@
 import { Context, h } from 'koishi'
+import type { Session } from 'koishi'
 import { tool } from '@langchain/core/tools'
+import type { RunnableConfig } from '@langchain/core/runnables'
 import { z } from 'zod'
 import { Config } from './config'
 import { StickerLibrary } from './library'
-
-// 请求级 session 存储：Chatluna 工具调用时能拿到当前会话
-const sessionStore = new Map<string, any>()
-
-/**
- * 必须在 Chatluna 之前 prepend 绑定。
- * Chatluna 处理消息也走 middleware，这里最先捕获 session。
- * 延迟清理，避免 Chatluna 异步工具调用时 session 已被删除。
- */
-export function bindSession(ctx: Context) {
-  ctx.middleware(async (session, next) => {
-    const id = `${session.platform}:${session.channelId}:${Date.now()}`
-    sessionStore.set('current', session)
-    sessionStore.set(id, session)
-    try {
-      return await next()
-    } finally {
-      setTimeout(() => {
-        if (sessionStore.get('current') === session) {
-          sessionStore.delete('current')
-        }
-        sessionStore.delete(id)
-      }, 120000)
-    }
-  }, true)
-}
 
 export function apply(ctx: Context, config: Config, library: StickerLibrary) {
   ctx.chatluna.platform.registerTool('sticker_send', {
@@ -37,17 +13,21 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       '当你想用表情包回复、表达情绪、活跃气氛时调用。' +
       '参数 intent 描述你想表达的情绪或场景（如“嘲笑”“开心”“无语”“点赞”）。',
     selector: () => true,
+    // Chatluna 会为每次工具调用注入当次会话上下文
     createTool: () => createStickerSendTool(library, config),
   })
 }
 
 /**
  * 用 tool() 工厂函数构造工具，避免 StructuredTool 的泛型递归。
- * 每次调用返回一个新实例，以便闭包捕获 library / config。
+ * session 由 Chatluna 在每次调用时注入，闭包捕获即可，不需要全局存储。
  */
 function createStickerSendTool(library: StickerLibrary, _config: Config) {
   const toolFactory = tool as unknown as (
-    fn: (input: { intent: string }) => Promise<string>,
+    fn: (
+      input: { intent: string },
+      config?: RunnableConfig
+    ) => Promise<string>,
     opts: {
       name: string
       description: string
@@ -56,9 +36,12 @@ function createStickerSendTool(library: StickerLibrary, _config: Config) {
   ) => unknown
 
   return toolFactory(
-    async (input: { intent: string }) => {
+    async (input: { intent: string }, runnableConfig?: RunnableConfig) => {
       const { intent } = input
-      const session = sessionStore.get('current')
+
+      // Chatluna 在每次工具调用时，将当次会话注入 configurable.session
+      const session: Session | undefined =
+        (runnableConfig?.configurable as any)?.session
       if (!session) {
         return '无法获取当前会话，请用文字回复。'
       }
@@ -96,7 +79,7 @@ function createStickerSendTool(library: StickerLibrary, _config: Config) {
         return '表情文件丢失，请用文字回复。'
       }
 
-      await session.send(h.image(`base64://${buf.toString('base64')}`))
+      await session.send(h.image(`data:image/png;base64,${buf.toString('base64')}`))
       await library.markUsed(picked.pHash)
 
       return `已发送表情：${picked.description || picked.pHash}`
