@@ -4,6 +4,7 @@ import * as path from 'path'
 import imghash from 'imghash'
 import { Config } from './config'
 
+const HASH_BITS = 8           // imghash 网格边长 → 8×8 = 64 bit
 const HASH_LENGTH = 16        // 64-bit = 16 个十六进制字符
 const SEGMENT_COUNT = 8       // 拆 8 段
 const SEGMENT_SIZE = HASH_LENGTH / SEGMENT_COUNT // 每段 2 字符
@@ -76,9 +77,9 @@ export class StickerLibrary {
   // ── pHash 计算 ────────────────────────────────────────
   async computePHash(buf: Buffer): Promise<string | null> {
     try {
-      const hash = await imghash.hash(buf, HASH_LENGTH)
+      const hash = await imghash.hash(buf, HASH_BITS)
       if (typeof hash !== 'string' || hash.length !== HASH_LENGTH) {
-        this.ctx.logger.warn(`[sticker] imghash 返回非法哈希: ${hash}`)
+        this.ctx.logger.warn(`[sticker] imghash 返回非法哈希: 長度: (length=${hash?.length}): ${hash},值: ${hash}`)
         return null
       }
       return hash.toLowerCase()
