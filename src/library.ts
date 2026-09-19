@@ -28,6 +28,16 @@ export class StickerLibrary {
           `${(e as Error)?.message ?? e}。请确认 judgeModel 配置正确、模型已加载。`
         )
       }
+
+      // 启动时清理一次，之后每小时清理
+      this.pruneStaleOccurrences().catch(e =>
+        ctx.logger.error('[sticker] occurrence 清理失败:', e)
+      )
+      ctx.setInterval(() => {
+        this.pruneStaleOccurrences().catch(e =>
+          ctx.logger.error('[sticker] occurrence 清理失败:', e)
+        )
+      }, 60 * 60 * 1000)
     })
   }
 
@@ -63,9 +73,6 @@ export class StickerLibrary {
   }
 
   // ── 记录出现（全局统计） ──────────────────────────────
-  // 说明：由于移除了内存索引，这里一次性拉取全部 occurrence 行，
-  // 在内存中做「精确匹配 → 相似匹配」两级查找。数据量大时会退化为
-  // O(n) 扫描，但每次只读取当前查询所需列，峰值内存可控。
   async recordOccurrence(pHash: string): Promise<OccurrenceResult> {
     const threshold = this.config.phashThreshold
     const all = await this.ctx.database.get('sticker_occurrence', {})
@@ -93,7 +100,6 @@ export class StickerLibrary {
       const canonicalHash = matched.pHash
       const newCount = matched.count + 1
       let newStatus = matched.status
-      // 仅 'new' 达到阈值时转入待审
       if (newCount >= this.config.judgeThreshold && matched.status === 'new') {
         newStatus = 'pending_review'
       }
@@ -105,7 +111,6 @@ export class StickerLibrary {
       return { canonicalHash, count: newCount, status: newStatus, isNew: false }
     }
 
-    // 新条目
     await this.ctx.database.create('sticker_occurrence', {
       pHash,
       count: 1,
@@ -140,6 +145,13 @@ export class StickerLibrary {
     }
   }
 
+  /** 删除本地图片文件（忽略不存在等错误） */
+  private async removeImageFile(pHash: string) {
+    try {
+      await fs.unlink(this.filePath(pHash))
+    } catch { }
+  }
+
   // ── 模型判断入口 ──────────────────────────────────────
   async handlePending(pHash: string, buf: Buffer) {
     if (!this.judgeModelRef?.value) {
@@ -149,7 +161,6 @@ export class StickerLibrary {
       )
       return
     }
-    // 若之前判断失败过（DB 状态仍为 judge_failed），跳过，避免反复触发
     const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
     if (rows.length && rows[0].status === 'judge_failed') return
 
@@ -244,7 +255,6 @@ export class StickerLibrary {
     }
   }
 
-  /** 检测错误信息是否表明模型不支持多模态图片输入 */
   private isVisionUnsupportedError(msg: string): boolean {
     const lower = msg.toLowerCase()
     return (
@@ -257,10 +267,6 @@ export class StickerLibrary {
   }
 
   // ── 手动重试判断 ──────────────────────────────────────
-  /**
-   * 清除某个 pHash 的判断失败记录并重新触发判断。
-   * 用于更换模型后重试之前失败的图片。
-   */
   async retryJudge(pHash: string): Promise<boolean> {
     const buf = await this.readImage(pHash)
     if (!buf) return false
@@ -273,7 +279,6 @@ export class StickerLibrary {
     return true
   }
 
-  /** 清除所有判断失败记录，下次出现时会重新判断 */
   async clearAllJudgeFailures(): Promise<number> {
     const failed = await this.ctx.database.get('sticker_occurrence', {
       status: 'judge_failed',
@@ -306,32 +311,77 @@ export class StickerLibrary {
     }
   }
 
-  // ── 可发送图淘汰 ──────────────────────────────────────
+  // ── 定时清理：未收藏 + lastSeenAt 超期 ────────────────
+  /**
+   * 删除满足以下全部条件的 sticker_occurrence 行及其本地图片：
+   *   - status !== 'collected'（未收藏：含 new / pending_review / rejected / judge_failed 等）
+   *   - lastSeenAt 早于「现在 - occurrenceTtlDays 天」
+   *
+   * 已收藏（collected）的记录永不在此处清理，由收藏淘汰逻辑负责。
+   * 被清掉的图若再次出现，会作为新图重新进入收集 / 判断流程。
+   */
+  async pruneStaleOccurrences(): Promise<number> {
+    const ttlMs = this.config.occurrenceTtlDays * 24 * 60 * 60 * 1000
+    const deadline = Date.now() - ttlMs
+
+    const all = await this.ctx.database.get('sticker_occurrence', {})
+    const targets = all.filter(
+      r => r.status !== 'collected' && (r.lastSeenAt || 0) < deadline
+    )
+    if (!targets.length) return 0
+
+    const hashes = targets.map(r => r.pHash)
+
+    // 分批删除，避免一次性 IN 查询过大
+    const BATCH = 500
+    for (let i = 0; i < hashes.length; i += BATCH) {
+      const batch = hashes.slice(i, i + BATCH)
+      await this.ctx.database.remove('sticker_occurrence', {
+        pHash: { $in: batch },
+      })
+      for (const h of batch) await this.removeImageFile(h)
+    }
+
+    this.ctx.logger.info(
+      `[sticker] 已清理 ${targets.length} 条未收藏且超过 ${this.config.occurrenceTtlDays} 天未出现的记录及其本地图片`
+    )
+    return targets.length
+  }
+
+  // ── 可发送图淘汰（最久未使用优先） ────────────────────
+  /**
+   * 当已收藏图片（sticker_meta）超过 maxSendableImages 时，
+   * 按「最久未使用」升序淘汰，直到数量回到上限。
+   *
+   * 排序键：lastUsedAt（从未使用过的用 collectedAt 兜底，
+   * 避免「刚收藏、还没被用过」的新表情因 lastUsedAt=0 被立即淘汰）。
+   *
+   * 淘汰动作：
+   *   - 删除 sticker_meta 记录
+   *   - 删除 sticker_occurrence 记录
+   *   - 删除本地图片文件
+   * 该图若再次出现，会作为新图重新进入收集 / 判断流程。
+   */
   private async enforceLibraryLimit() {
     const all = await this.ctx.database.get('sticker_meta', {})
     if (all.length <= this.config.maxSendableImages) return
 
-    const sorted = all.sort(
-      (a, b) => (a.collectedAt || 0) - (b.collectedAt || 0)
-    )
+    const activityTime = (m: typeof all[number]) =>
+      m.lastUsedAt || m.collectedAt || 0
+
+    const sorted = all.sort((a, b) => activityTime(a) - activityTime(b))
     const removeCount = all.length - this.config.maxSendableImages
     const toRemove = sorted.slice(0, removeCount)
 
     for (const m of toRemove) {
       await this.ctx.database.remove('sticker_meta', { pHash: m.pHash })
-      await this.ctx.database.set(
-        'sticker_occurrence',
-        { pHash: m.pHash },
-        { status: 'evicted' }
-      )
-      try {
-        await fs.unlink(this.filePath(m.pHash))
-      } catch { }
+      await this.ctx.database.remove('sticker_occurrence', { pHash: m.pHash })
+      await this.removeImageFile(m.pHash)
     }
 
     this.ctx.logger.info(
       `[sticker] 可发送图上限 ${this.config.maxSendableImages} 触发，` +
-      `已淘汰 ${toRemove.length} 张最旧的收藏表情`
+      `已淘汰 ${toRemove.length} 张最久未使用的收藏表情（含记录与本地文件）`
     )
   }
 

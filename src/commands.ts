@@ -86,7 +86,12 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       const count = await library.clearAllJudgeFailures()
       return `已清除 ${count} 条失败记录，将在图片再次出现时重新判断`
     })
-
+  cmd
+    .subcommand('.prune', '手动清理未收藏且超期的记录及其本地图片')
+    .action(async () => {
+      const n = await library.pruneStaleOccurrences()
+      return `清理完成，共移除 ${n} 条记录及其本地图片`
+    })
   cmd.subcommand('.stat', '查看本地库统计').action(async () => {
     const all = await ctx.database.get('sticker_occurrence', {})
     const collected = all.filter(r => r.status === 'collected').length

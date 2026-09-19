@@ -12,7 +12,7 @@ chatluna擴展，給予了模型根據自身判斷收藏、發送表情的能力
 - **本地库**：图片存本地文件系统，元数据存数据库，不依赖 QQ 收藏夹
 - **容量上限**：可发送图片超过 `maxSendableImages`（默认 10000）时，按收藏时间淘汰最旧的
 - **自主发送**：注册 Chatluna 工具 `sticker_send`，AI 根据表达意图自主选图并发送
-- **管理命令**：`sticker.list` / `sticker.show` / `sticker.send` / `sticker.retry` / `sticker.stat`
+- **过期淘汰**：超过一定时间的未收藏非活跃表情包，与超过一定数量的以收藏未活跃表情包自动清理
 
 ## 安装
 

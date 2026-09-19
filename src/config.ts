@@ -7,6 +7,7 @@ export interface Config {
   judgeModel: string
   phashThreshold: number
   maxSendableImages: number
+  occurrenceTtlDays: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -29,5 +30,8 @@ export const Config: Schema<Config> = Schema.object({
       '阈值 ≤ 7 时内存分段索引保证不漏检；超过 7 将回退全量遍历。'),
 
   maxSendableImages: Schema.number().default(10000)
-    .description('本地可发送图片（已收藏状态）的最大数量。超过后按收藏时间淘汰最旧的。'),
+    .description('本地可发送图片（已收藏状态）的最大数量。超过后按最后使用时间淘汰最久未使用的。'),
+
+  occurrenceTtlDays: Schema.number().default(10)
+    .description('未收藏（status 非 collected）的追踪记录及其本地图片，超过此天数未再出现将被自动清理。'),
 })
