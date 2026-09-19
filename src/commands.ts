@@ -94,7 +94,6 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
     const rejected = all.filter(r => r.status === 'rejected').length
     const evicted = all.filter(r => r.status === 'evicted').length
     const failed = all.filter(r => r.status === 'judge_failed').length
-    const idx = library.getIndexStats()
     return [
       `追踪中: ${all.length}`,
       `已收藏: ${collected}`,
@@ -102,7 +101,6 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       `已拒绝: ${rejected}`,
       `已淘汰: ${evicted}`,
       `判断失败: ${failed}`,
-      `内存索引: ${idx.totalHashes} 条 / ${idx.totalSegments} 段`,
       `可发送上限: ${config.maxSendableImages}`,
     ].join('\n')
   })

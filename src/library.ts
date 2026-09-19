@@ -6,8 +6,6 @@ import { Config } from './config'
 
 const HASH_BITS = 8           // imghash 网格边长 → 8×8 = 64 bit
 const HASH_LENGTH = 16        // 64-bit = 16 个十六进制字符
-const SEGMENT_COUNT = 8       // 拆 8 段
-const SEGMENT_SIZE = HASH_LENGTH / SEGMENT_COUNT // 每段 2 字符
 
 export interface OccurrenceResult {
   canonicalHash: string
@@ -19,18 +17,8 @@ export interface OccurrenceResult {
 export class StickerLibrary {
   private judgeModelRef: any = null
 
-  // ── 内存 pHash 索引 ──────────────────────────────────
-  // allHashes: 所有见过的 pHash（含 rejected/evicted，避免重复审核）
-  // segmentMap: 段值 → pHash 集合，用于快速缩小候选集
-  private allHashes: Set<string> = new Set()
-  private segmentMap: Map<string, Set<string>> = new Map()
-
-  // 模型判断失败过的 pHash：避免同一张图反复触发失败（日志/成本）
-  private judgeFailedHashes: Set<string> = new Set()
-
   constructor(private ctx: Context, private config: Config) {
     ctx.on('ready', async () => {
-      await this.loadIndex()
       try {
         this.judgeModelRef = await ctx.chatluna.createChatModel(config.judgeModel)
         ctx.logger.info(`[sticker] 判断模型已就绪: ${config.judgeModel}`)
@@ -43,43 +31,14 @@ export class StickerLibrary {
     })
   }
 
-  // ── 索引加载与维护 ────────────────────────────────────
-  private async loadIndex() {
-    try {
-      const rows = await this.ctx.database.get('sticker_occurrence', {})
-      this.allHashes.clear()
-      this.segmentMap.clear()
-      this.judgeFailedHashes.clear()
-      for (const row of rows) {
-        this.addToIndex(row.pHash)
-        if (row.status === 'judge_failed') this.judgeFailedHashes.add(row.pHash)
-      }
-      this.ctx.logger.info(`[sticker] 内存 pHash 索引已加载 ${rows.length} 条`)
-    } catch (e) {
-      this.ctx.logger.error('[sticker] 加载内存索引失败:', e)
-    }
-  }
-
-  private addToIndex(pHash: string) {
-    if (this.allHashes.has(pHash)) return
-    this.allHashes.add(pHash)
-    for (let i = 0; i < SEGMENT_COUNT; i++) {
-      const seg = pHash.slice(i * SEGMENT_SIZE, (i + 1) * SEGMENT_SIZE)
-      let set = this.segmentMap.get(seg)
-      if (!set) {
-        set = new Set()
-        this.segmentMap.set(seg, set)
-      }
-      set.add(pHash)
-    }
-  }
-
   // ── pHash 计算 ────────────────────────────────────────
   async computePHash(buf: Buffer): Promise<string | null> {
     try {
       const hash = await imghash.hash(buf, HASH_BITS)
       if (typeof hash !== 'string' || hash.length !== HASH_LENGTH) {
-        this.ctx.logger.warn(`[sticker] imghash 返回非法哈希: 長度: (length=${hash?.length}): ${hash},值: ${hash}`)
+        this.ctx.logger.warn(
+          `[sticker] imghash 返回非法哈希 (length=${hash?.length}): ${hash}`
+        )
         return null
       }
       return hash.toLowerCase()
@@ -103,48 +62,39 @@ export class StickerLibrary {
     return dist
   }
 
-  // ── 内存索引相似查询 ──────────────────────────────────
-  private findSimilar(pHash: string): string | null {
-    const threshold = this.config.phashThreshold
-
-    if (threshold > SEGMENT_COUNT - 1) {
-      // 阈值过大，分段无法保证不漏检 → 全量遍历
-      for (const h of this.allHashes) {
-        if (this.hammingDistance(pHash, h) <= threshold) return h
-      }
-      return null
-    }
-
-    // 分段预筛选：收集所有段值命中的 pHash
-    const candidates = new Set<string>()
-    for (let i = 0; i < SEGMENT_COUNT; i++) {
-      const seg = pHash.slice(i * SEGMENT_SIZE, (i + 1) * SEGMENT_SIZE)
-      const set = this.segmentMap.get(seg)
-      if (set) for (const h of set) candidates.add(h)
-    }
-
-    // 候选集内计算真实汉明距离
-    for (const h of candidates) {
-      if (this.hammingDistance(pHash, h) <= threshold) return h
-    }
-    return null
-  }
-
   // ── 记录出现（全局统计） ──────────────────────────────
+  // 说明：由于移除了内存索引，这里一次性拉取全部 occurrence 行，
+  // 在内存中做「精确匹配 → 相似匹配」两级查找。数据量大时会退化为
+  // O(n) 扫描，但每次只读取当前查询所需列，峰值内存可控。
   async recordOccurrence(pHash: string): Promise<OccurrenceResult> {
-    const similar = this.findSimilar(pHash)
-    const canonicalHash = similar || pHash
+    const threshold = this.config.phashThreshold
+    const all = await this.ctx.database.get('sticker_occurrence', {})
 
-    const existing = await this.ctx.database.get('sticker_occurrence', {
-      pHash: canonicalHash,
-    })
+    let matched: typeof all[number] | null = null
 
-    if (existing.length) {
-      const row = existing[0]
-      const newCount = row.count + 1
-      let newStatus = row.status
+    // 1) 精确匹配
+    for (const row of all) {
+      if (row.pHash === pHash) {
+        matched = row
+        break
+      }
+    }
+    // 2) 相似匹配（汉明距离）
+    if (!matched) {
+      for (const row of all) {
+        if (this.hammingDistance(pHash, row.pHash) <= threshold) {
+          matched = row
+          break
+        }
+      }
+    }
+
+    if (matched) {
+      const canonicalHash = matched.pHash
+      const newCount = matched.count + 1
+      let newStatus = matched.status
       // 仅 'new' 达到阈值时转入待审
-      if (newCount >= this.config.judgeThreshold && row.status === 'new') {
+      if (newCount >= this.config.judgeThreshold && matched.status === 'new') {
         newStatus = 'pending_review'
       }
       await this.ctx.database.set(
@@ -157,15 +107,14 @@ export class StickerLibrary {
 
     // 新条目
     await this.ctx.database.create('sticker_occurrence', {
-      pHash: canonicalHash,
+      pHash,
       count: 1,
       status: 'new',
       firstSeenAt: Date.now(),
       lastSeenAt: Date.now(),
       judgeError: '',
     })
-    this.addToIndex(canonicalHash)
-    return { canonicalHash, count: 1, status: 'new', isNew: true }
+    return { canonicalHash: pHash, count: 1, status: 'new', isNew: true }
   }
 
   // ── 图片文件存取 ──────────────────────────────────────
@@ -178,7 +127,7 @@ export class StickerLibrary {
     try {
       await fs.access(fp)
       return
-    } catch {}
+    } catch { }
     await fs.mkdir(path.dirname(fp), { recursive: true })
     await fs.writeFile(fp, buf)
   }
@@ -193,16 +142,17 @@ export class StickerLibrary {
 
   // ── 模型判断入口 ──────────────────────────────────────
   async handlePending(pHash: string, buf: Buffer) {
-    // 该 pHash 之前判断失败过 → 跳过，避免反复触发
-    if (this.judgeFailedHashes.has(pHash)) return
     if (!this.judgeModelRef?.value) {
-      // 模型引用尚未就绪（如启动时创建失败），记录一次错误
       this.ctx.logger.error(
         `[sticker] 模型 ${this.config.judgeModel} 不可用，跳过对 ${pHash} 的判断。` +
         `请检查 judgeModel 配置与 Chatluna 模型加载状态。`
       )
       return
     }
+    // 若之前判断失败过（DB 状态仍为 judge_failed），跳过，避免反复触发
+    const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
+    if (rows.length && rows[0].status === 'judge_failed') return
+
     await this.judgeByModel(pHash, buf)
   }
 
@@ -217,7 +167,7 @@ export class StickerLibrary {
             '你是表情包收藏助手。判断这张在群聊中反复出现的图片是否适合收藏为表情包。\n' +
             '适合：有趣、有梗、能表达情绪、可复用。\n' +
             '不适合：低俗、色情、纯截图、文字图、低质量、过于个人化（如某人自拍）。\n' +
-            '一旦有符合的不适合条件则忽略合适部分\n'+
+            '一旦有符合的不适合条件则忽略合适部分\n' +
             '只回复 JSON，不要解释：{"collect": true/false, "tags": ["标签1","标签2"], "description": "简短描述", "usageHint": "适合什么场景用"}',
         },
         {
@@ -239,8 +189,8 @@ export class StickerLibrary {
           ? result.content
           : Array.isArray(result.content)
             ? result.content
-                .map((c: any) => (typeof c === 'string' ? c : c?.text || ''))
-                .join('')
+              .map((c: any) => (typeof c === 'string' ? c : c?.text || ''))
+              .join('')
             : String(result.content)
 
       const parsed = this.parseJson(text)
@@ -276,30 +226,21 @@ export class StickerLibrary {
       const visionUnsupported = this.isVisionUnsupportedError(errMsg)
 
       if (visionUnsupported) {
-        // 模型不支持多模态：记录明确错误，标记为 judge_failed，不再重试
         this.ctx.logger.error(
           `[sticker] 模型 ${this.config.judgeModel} 不支持多模态图片输入，` +
           `已跳过后续判断。请更换为支持图片的模型后重启插件。\n` +
           `原始错误: ${errMsg}`
         )
-        await this.ctx.database.set(
-          'sticker_occurrence',
-          { pHash },
-          { status: 'judge_failed', judgeError: errMsg.slice(0, 500) }
-        )
-        this.judgeFailedHashes.add(pHash)
       } else {
-        // 其他错误：记录错误日志并标记失败，避免反复触发
         this.ctx.logger.error(
           `[sticker] 模型判断失败 pHash=${pHash}: ${errMsg}`
         )
-        await this.ctx.database.set(
-          'sticker_occurrence',
-          { pHash },
-          { status: 'judge_failed', judgeError: errMsg.slice(0, 500) }
-        )
-        this.judgeFailedHashes.add(pHash)
       }
+      await this.ctx.database.set(
+        'sticker_occurrence',
+        { pHash },
+        { status: 'judge_failed', judgeError: errMsg.slice(0, 500) }
+      )
     }
   }
 
@@ -323,7 +264,6 @@ export class StickerLibrary {
   async retryJudge(pHash: string): Promise<boolean> {
     const buf = await this.readImage(pHash)
     if (!buf) return false
-    this.judgeFailedHashes.delete(pHash)
     await this.ctx.database.set(
       'sticker_occurrence',
       { pHash },
@@ -345,7 +285,6 @@ export class StickerLibrary {
         { status: 'pending_review', judgeError: '' }
       )
     }
-    this.judgeFailedHashes.clear()
     return failed.length
   }
 
@@ -368,16 +307,6 @@ export class StickerLibrary {
   }
 
   // ── 可发送图淘汰 ──────────────────────────────────────
-  /**
-   * 当已收藏图片（sticker_meta）超过 maxSendableImages 时，
-   * 按 collectedAt 升序删除最旧的，直到数量回到上限。
-   *
-   * 淘汰动作：
-   *   - 删除 sticker_meta 记录
-   *   - 删除本地图片文件
-   *   - sticker_occurrence.status 改为 'evicted'（避免重复审核）
-   *   - 内存索引保留该 pHash（仍在 allHashes 中，语义上"见过"）
-   */
   private async enforceLibraryLimit() {
     const all = await this.ctx.database.get('sticker_meta', {})
     if (all.length <= this.config.maxSendableImages) return
@@ -397,7 +326,7 @@ export class StickerLibrary {
       )
       try {
         await fs.unlink(this.filePath(m.pHash))
-      } catch {}
+      } catch { }
     }
 
     this.ctx.logger.info(
@@ -414,17 +343,5 @@ export class StickerLibrary {
     } catch {
       return { collect: false }
     }
-  }
-
-  getIndexStats() {
-    return {
-      totalHashes: this.allHashes.size,
-      totalSegments: this.segmentMap.size,
-      judgeFailed: this.judgeFailedHashes.size,
-    }
-  }
-
-  isJudgeFailed(pHash: string) {
-    return this.judgeFailedHashes.has(pHash)
   }
 }
