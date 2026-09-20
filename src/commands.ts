@@ -93,19 +93,25 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       return `清理完成，共移除 ${n} 条记录及其本地图片`
     })
   cmd.subcommand('.stat', '查看本地库统计').action(async () => {
-    const all = await ctx.database.get('sticker_occurrence', {})
-    const collected = all.filter(r => r.status === 'collected').length
-    const pending = all.filter(r => r.status === 'pending_review').length
-    const rejected = all.filter(r => r.status === 'rejected').length
-    const evicted = all.filter(r => r.status === 'evicted').length
-    const failed = all.filter(r => r.status === 'judge_failed').length
+    // 【优化】按状态分别查询，避免一次性拉取全表
+    const statuses = ['collected', 'pending_review', 'rejected', 'evicted', 'judge_failed']
+    const counts: Record<string, number> = {}
+
+    for (const status of statuses) {
+      const rows = await ctx.database.get('sticker_occurrence', { status })
+      counts[status] = rows.length
+    }
+
+    // 追踪中总数 = 所有状态之和
+    const total = Object.values(counts).reduce((a, b) => a + b, 0)
+
     return [
-      `追踪中: ${all.length}`,
-      `已收藏: ${collected}`,
-      `待审: ${pending}`,
-      `已拒绝: ${rejected}`,
-      `已淘汰: ${evicted}`,
-      `判断失败: ${failed}`,
+      `追踪中: ${total}`,
+      `已收藏: ${counts['collected'] || 0}`,
+      `待审: ${counts['pending_review'] || 0}`,
+      `已拒绝: ${counts['rejected'] || 0}`,
+      `已淘汰: ${counts['evicted'] || 0}`,
+      `判断失败: ${counts['judge_failed'] || 0}`,
       `可发送上限: ${config.maxSendableImages}`,
     ].join('\n')
   })

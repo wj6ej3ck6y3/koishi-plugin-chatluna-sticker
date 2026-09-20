@@ -26,9 +26,10 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       }
 
       // 进入待审 → 触发模型判断（异步，不阻塞消息处理）
+      // 【修改】不再传递 buf，由 handlePending 内部根据 pHash 读取文件，释放当前作用域的 Buffer
       if (status === 'pending_review') {
         library
-          .handlePending(canonicalHash, buf)
+          .handlePending(canonicalHash)
           .catch(e => ctx.logger.error('[sticker] handlePending 失败:', e))
       }
     }

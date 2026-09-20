@@ -14,8 +14,28 @@ export interface OccurrenceResult {
   isNew: boolean
 }
 
+// 【新增】简易信号量，限制并发数
+class Semaphore {
+  private tasks: (() => void)[] = []
+  private count: number
+  constructor(count: number) { this.count = count }
+  async acquire() {
+    if (this.count > 0) { this.count--; return }
+    await new Promise<void>(resolve => this.tasks.push(resolve))
+  }
+  release() {
+    this.count++
+    if (this.tasks.length > 0) {
+      this.count--
+      const next = this.tasks.shift()
+      next?.()
+    }
+  }
+}
+
 export class StickerLibrary {
   private judgeModelRef: any = null
+  private judgeSemaphore = new Semaphore(3) // 【新增】最多同时判断 3 张图
 
   constructor(private ctx: Context, private config: Config) {
     ctx.on('ready', async () => {
@@ -75,19 +95,14 @@ export class StickerLibrary {
   // ── 记录出现（全局统计） ──────────────────────────────
   async recordOccurrence(pHash: string): Promise<OccurrenceResult> {
     const threshold = this.config.phashThreshold
-    const all = await this.ctx.database.get('sticker_occurrence', {})
 
-    let matched: typeof all[number] | null = null
+    // 【优化】先精确匹配，绝大多数情况会命中这里，避免全表拉取
+    let matched = (await this.ctx.database.get('sticker_occurrence', { pHash }))[0]
 
-    // 1) 精确匹配
-    for (const row of all) {
-      if (row.pHash === pHash) {
-        matched = row
-        break
-      }
-    }
-    // 2) 相似匹配（汉明距离）
+    // 【优化】如果没有精确匹配，再尝试相似匹配。
+    // 注意：如果表数据量极大（>5万），这里的全量拉取依然有风险，建议引入专门的哈希索引库。
     if (!matched) {
+      const all = await this.ctx.database.get('sticker_occurrence', {})
       for (const row of all) {
         if (this.hammingDistance(pHash, row.pHash) <= threshold) {
           matched = row
@@ -153,7 +168,8 @@ export class StickerLibrary {
   }
 
   // ── 模型判断入口 ──────────────────────────────────────
-  async handlePending(pHash: string, buf: Buffer) {
+  // 【修改】移除 buf 参数
+  async handlePending(pHash: string) {
     if (!this.judgeModelRef?.value) {
       this.ctx.logger.error(
         `[sticker] 模型 ${this.config.judgeModel} 不可用，跳过对 ${pHash} 的判断。` +
@@ -164,11 +180,20 @@ export class StickerLibrary {
     const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
     if (rows.length && rows[0].status === 'judge_failed') return
 
+    // 【修改】内部读取图片，不再依赖外部传入 Buffer
+    const buf = await this.readImage(pHash)
+    if (!buf) {
+      this.ctx.logger.error(`[sticker] 无法读取图片文件 ${pHash}，跳过判断`)
+      return
+    }
+
     await this.judgeByModel(pHash, buf)
   }
 
   // ── 模型判断 ──────────────────────────────────────────
   private async judgeByModel(pHash: string, buf: Buffer) {
+    // 【新增】并发控制，防止瞬间大量请求导致 OOM
+    await this.judgeSemaphore.acquire()
     try {
       const model = this.judgeModelRef.value
       const result = await model.invoke([
@@ -252,6 +277,8 @@ export class StickerLibrary {
         { pHash },
         { status: 'judge_failed', judgeError: errMsg.slice(0, 500) }
       )
+    } finally {
+      this.judgeSemaphore.release() // 【新增】释放并发锁
     }
   }
 
@@ -267,6 +294,7 @@ export class StickerLibrary {
   }
 
   // ── 手动重试判断 ──────────────────────────────────────
+  // 【修改】移除 buf 参数，内部读取图片
   async retryJudge(pHash: string): Promise<boolean> {
     const buf = await this.readImage(pHash)
     if (!buf) return false
@@ -324,10 +352,12 @@ export class StickerLibrary {
     const ttlMs = this.config.occurrenceTtlDays * 24 * 60 * 60 * 1000
     const deadline = Date.now() - ttlMs
 
-    const all = await this.ctx.database.get('sticker_occurrence', {})
-    const targets = all.filter(
-      r => r.status !== 'collected' && (r.lastSeenAt || 0) < deadline
-    )
+    // 【优化】使用数据库条件查询，替代全表拉取后在内存过滤
+    const targets = await this.ctx.database.get('sticker_occurrence', {
+      status: { $ne: 'collected' },
+      lastSeenAt: { $lt: deadline }
+    })
+
     if (!targets.length) return 0
 
     const hashes = targets.map(r => r.pHash)
