@@ -8,6 +8,7 @@ export interface Config {
   phashThreshold: number
   maxSendableImages: number
   occurrenceTtlDays: number
+  judgeTimeoutMinutes: number   // 新增
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -16,6 +17,9 @@ export const Config: Schema<Config> = Schema.object({
 
   judgeThreshold: Schema.number().default(5)
     .description('一张图全局出现次数达到此值后，提交给模型判断是否收藏。'),
+  phashThreshold: Schema.number().default(5)
+    .description('pHash 汉明距离阈值：≤ 该值视为同一张图。64-bit 哈希拆成 8 段（每段 8 bit），' +
+      '阈值 ≤ 7 时内存分段索引保证不漏检；超过 7 将回退全量遍历。'),
 
   judgeModel: Schema.dynamic(JUDGE_MODEL_SCHEMA_KEY)
     .default('deepseek/deepseek-v4-flash')
@@ -24,14 +28,19 @@ export const Config: Schema<Config> = Schema.object({
       '下拉列表来自当前已加载的 Chatluna 模型；' +
       '若模型不支持多模态，插件会记录错误日志并跳过对该图的重复尝试。'
     ),
-
-  phashThreshold: Schema.number().default(5)
-    .description('pHash 汉明距离阈值：≤ 该值视为同一张图。64-bit 哈希拆成 8 段（每段 8 bit），' +
-      '阈值 ≤ 7 时内存分段索引保证不漏检；超过 7 将回退全量遍历。'),
+  judgeTimeoutMinutes: Schema.number()
+    .default(10)
+    .min(1)
+    .max(1440)
+    .description(
+      '单次模型判断的超时时间（分钟）。' +
+      '超过此时间仍停留在“判断中”状态的记录，会被视为进程崩溃残留，' +
+      '在启动或定时扫描时自动重置并重新提交判断。' +
+      '建议设置为大于模型最长响应时间，通常 10 分钟足够。'
+    ),
 
   maxSendableImages: Schema.number().default(10000)
     .description('本地可发送图片（已收藏状态）的最大数量。超过后按最后使用时间淘汰最久未使用的。'),
-
   occurrenceTtlDays: Schema.number().default(10)
     .description('未收藏（status 非 collected）的追踪记录及其本地图片，超过此天数未再出现将被自动清理。'),
 })

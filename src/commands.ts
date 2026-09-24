@@ -113,6 +113,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       `已淘汰: ${counts['evicted'] || 0}`,
       `判断失败: ${counts['judge_failed'] || 0}`,
       `可发送上限: ${config.maxSendableImages}`,
+      `判断超时: ${config.judgeTimeoutMinutes} 分钟`,   // 新增
     ].join('\n')
   })
 }

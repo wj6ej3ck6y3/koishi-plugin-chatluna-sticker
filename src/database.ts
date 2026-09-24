@@ -14,6 +14,8 @@ export interface StickerOccurrence {
   firstSeenAt: number
   lastSeenAt: number
   judgeError: string
+  judgeStartedAt: number   // 新增：进入 judging 的时间戳
+  judgeToken: string       // 新增：占用令牌，防止误重置/误覆盖
 }
 
 export interface StickerMeta {
@@ -36,6 +38,8 @@ export function apply(ctx: Context) {
     firstSeenAt: 'unsigned',
     lastSeenAt: 'unsigned',
     judgeError: 'string',
+    judgeStartedAt: 'unsigned',   // 新增
+    judgeToken: 'string',         // 新增
   }, { primary: 'pHash' })
 
   ctx.model.extend('sticker_meta', {

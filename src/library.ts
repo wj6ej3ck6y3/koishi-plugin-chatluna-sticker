@@ -3,6 +3,7 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import imghash from 'imghash'
 import { Config } from './config'
+import { StickerOccurrence } from './database'   // 新增
 
 const HASH_BITS = 8           // imghash 网格边长 → 8×8 = 64 bit
 const HASH_LENGTH = 16        // 64-bit = 16 个十六进制字符
@@ -14,7 +15,7 @@ export interface OccurrenceResult {
   isNew: boolean
 }
 
-// 【新增】简易信号量，限制并发数
+// 简易信号量，限制并发数
 class Semaphore {
   private tasks: (() => void)[] = []
   private count: number
@@ -35,7 +36,8 @@ class Semaphore {
 
 export class StickerLibrary {
   private judgeModelRef: any = null
-  private judgeSemaphore = new Semaphore(3) // 【新增】最多同时判断 3 张图
+  private judgeSemaphore = new Semaphore(3) // 最多同时判断 3 张图
+  private judging = new Set<string>()   // 保留：单进程快速短路
 
   constructor(private ctx: Context, private config: Config) {
     ctx.on('ready', async () => {
@@ -48,12 +50,18 @@ export class StickerLibrary {
           `${(e as Error)?.message ?? e}。请确认 judgeModel 配置正确、模型已加载。`
         )
       }
-
+      // 崩溃恢复：启动时立即执行一次
+      this.recoverStuckJudges().catch(e =>
+        ctx.logger.error('[sticker] 恢复超时判断失败:', e)
+      )
       // 启动时清理一次，之后每小时清理
       this.pruneStaleOccurrences().catch(e =>
         ctx.logger.error('[sticker] occurrence 清理失败:', e)
       )
       ctx.setInterval(() => {
+        this.recoverStuckJudges().catch(e =>
+          ctx.logger.error('[sticker] 恢复超时判断失败:', e)
+        )
         this.pruneStaleOccurrences().catch(e =>
           ctx.logger.error('[sticker] occurrence 清理失败:', e)
         )
@@ -168,7 +176,6 @@ export class StickerLibrary {
   }
 
   // ── 模型判断入口 ──────────────────────────────────────
-  // 【修改】移除 buf 参数
   async handlePending(pHash: string) {
     if (!this.judgeModelRef?.value) {
       this.ctx.logger.error(
@@ -178,9 +185,12 @@ export class StickerLibrary {
       return
     }
     const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
-    if (rows.length && rows[0].status === 'judge_failed') return
+    if (!rows.length) return
 
-    // 【修改】内部读取图片，不再依赖外部传入 Buffer
+    // 只处理 pending_review；judging / collected / rejected / judge_failed 跳过
+    if (rows[0].status !== 'pending_review') return
+
+    // 内部读取图片
     const buf = await this.readImage(pHash)
     if (!buf) {
       this.ctx.logger.error(`[sticker] 无法读取图片文件 ${pHash}，跳过判断`)
@@ -189,10 +199,52 @@ export class StickerLibrary {
 
     await this.judgeByModel(pHash, buf)
   }
+  private async tryAcquireJudge(pHash: string): Promise<string | null> {
+    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 
+    await this.ctx.database.set(
+      'sticker_occurrence',
+      { pHash, status: 'pending_review' },
+      {
+        status: 'judging',
+        judgeStartedAt: Date.now(),
+        judgeToken: token,
+        judgeError: '',
+      }
+    )
+
+    const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
+    if (rows[0]?.status === 'judging' && rows[0]?.judgeToken === token) {
+      return token
+    }
+    return null
+  }
+  private async releaseJudge(
+    pHash: string,
+    token: string,
+    update: Partial<StickerOccurrence>
+  ) {
+    await this.ctx.database.set(
+      'sticker_occurrence',
+      { pHash, status: 'judging', judgeToken: token },
+      { ...update, judgeToken: '', judgeStartedAt: 0 }
+    )
+  }
   // ── 模型判断 ──────────────────────────────────────────
   private async judgeByModel(pHash: string, buf: Buffer) {
-    // 【新增】并发控制，防止瞬间大量请求导致 OOM
+    // 单进程快速短路
+    if (this.judging.has(pHash)) return
+
+    const token = await this.tryAcquireJudge(pHash)
+    if (!token) {
+      this.ctx.logger.debug(`[sticker] ${pHash} 已被占用或状态不符，跳过`)
+      return
+    }
+
+    this.judging.add(pHash)
+
+    try {
+    // 并发控制，防止瞬间大量请求导致 OOM
     await this.judgeSemaphore.acquire()
     try {
       const model = this.judgeModelRef.value
@@ -240,21 +292,13 @@ export class StickerLibrary {
           useCount: 0,
           collectedAt: Date.now(),
         }])
-        await this.ctx.database.set(
-          'sticker_occurrence',
-          { pHash },
-          { status: 'collected', judgeError: '' }
-        )
+        await this.releaseJudge(pHash, token, { status: 'collected' })
         this.ctx.logger.info(
           `[sticker] 模型已收藏 ${pHash}: ${parsed.description || '(无描述)'}`
         )
         await this.enforceLibraryLimit()
       } else {
-        await this.ctx.database.set(
-          'sticker_occurrence',
-          { pHash },
-          { status: 'rejected', judgeError: '' }
-        )
+        await this.releaseJudge(pHash, token, { status: 'rejected' })
         this.ctx.logger.info(`[sticker] 模型拒绝 ${pHash}`)
       }
     } catch (e: any) {
@@ -272,13 +316,15 @@ export class StickerLibrary {
           `[sticker] 模型判断失败 pHash=${pHash}: ${errMsg}`
         )
       }
-      await this.ctx.database.set(
-        'sticker_occurrence',
-        { pHash },
-        { status: 'judge_failed', judgeError: errMsg.slice(0, 500) }
-      )
+      await this.releaseJudge(pHash, token, {
+        status: 'judge_failed',
+        judgeError: errMsg.slice(0, 500),
+      })
     } finally {
-      this.judgeSemaphore.release() // 【新增】释放并发锁
+      this.judgeSemaphore.release() // 释放并发锁
+      }
+    } finally {
+      this.judging.delete(pHash)
     }
   }
 
@@ -294,10 +340,17 @@ export class StickerLibrary {
   }
 
   // ── 手动重试判断 ──────────────────────────────────────
-  // 【修改】移除 buf 参数，内部读取图片
+  // 内部读取图片
   async retryJudge(pHash: string): Promise<boolean> {
     const buf = await this.readImage(pHash)
     if (!buf) return false
+
+    const rows = await this.ctx.database.get('sticker_occurrence', { pHash })
+    if (rows[0]?.status === 'judging') {
+      this.ctx.logger.warn(`[sticker] ${pHash} 正在判断中，忽略本次重试`)
+      return false
+    }
+
     await this.ctx.database.set(
       'sticker_occurrence',
       { pHash },
@@ -306,7 +359,51 @@ export class StickerLibrary {
     await this.judgeByModel(pHash, buf)
     return true
   }
+  async recoverStuckJudges(): Promise<number> {
+    const timeoutMs = this.config.judgeTimeoutMinutes * 60 * 1000
+    const deadline = Date.now() - timeoutMs
 
+    const stuck = await this.ctx.database.get('sticker_occurrence', {
+      status: 'judging',
+      judgeStartedAt: { $lt: deadline },
+    })
+
+    let recovered = 0
+    for (const row of stuck) {
+      await this.ctx.database.set(
+        'sticker_occurrence',
+        {
+          pHash: row.pHash,
+          status: 'judging',
+          judgeToken: row.judgeToken,
+        },
+        {
+          status: 'pending_review',
+          judgeError: '',
+          judgeToken: '',
+          judgeStartedAt: 0,
+        }
+      )
+
+      recovered++
+      this.ctx.logger.warn(
+        `[sticker] 检测到超时判断 ${row.pHash}` +
+        `（超过 ${this.config.judgeTimeoutMinutes} 分钟），已重置并重新提交`
+      )
+
+      this.handlePending(row.pHash).catch(e =>
+        this.ctx.logger.error(`[sticker] 恢复判断 ${row.pHash} 失败:`, e)
+      )
+    }
+
+    if (recovered) {
+      this.ctx.logger.info(
+        `[sticker] 共恢复 ${recovered} 条超时判断记录` +
+        `（超时阈值 ${this.config.judgeTimeoutMinutes} 分钟）`
+      )
+    }
+    return recovered
+  }
   async clearAllJudgeFailures(): Promise<number> {
     const failed = await this.ctx.database.get('sticker_occurrence', {
       status: 'judge_failed',
@@ -340,11 +437,7 @@ export class StickerLibrary {
   }
 
   // ── 定时清理：未收藏 + lastSeenAt 超期 ────────────────
-  /**
-   * 删除满足以下全部条件的 sticker_occurrence 行及其本地图片：
-   *   - status !== 'collected'（未收藏：含 new / pending_review / rejected / judge_failed 等）
-   *   - lastSeenAt 早于「现在 - occurrenceTtlDays 天」
-   *
+  /*
    * 已收藏（collected）的记录永不在此处清理，由收藏淘汰逻辑负责。
    * 被清掉的图若再次出现，会作为新图重新进入收集 / 判断流程。
    */
