@@ -8,7 +8,28 @@ on:
 
 jobs:
   publish_npm:
+    runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write   # 必需：允许获取 OIDC 令牌
       contents: read
-    uses: koikirin/buildplate/.github/workflows/publish_npm.buildplate.yml@v1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24          # 自带 npm 11+，满足 Trusted Publishing 要求
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build
+        run: yarn build
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        # 不要设置 NODE_AUTH_TOKEN，OIDC 会自动认证

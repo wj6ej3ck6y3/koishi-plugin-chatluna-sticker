@@ -72,7 +72,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
     })
 
   cmd
-    .subcommand('.retry <pHash:string>', '重试对指定图片的模型判断')
+    .subcommand('.retry <pHash:string>', '重试对指定图片的模型判断', { authority: 3 })
     .action(async ({ session }, pHash) => {
       if (!session) return
       const ok = await library.retryJudge(pHash)
@@ -80,14 +80,14 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
     })
 
   cmd
-    .subcommand('.retry-all', '重试所有判断失败的图片')
+    .subcommand('.retry.all', '重试所有判断失败的图片', { authority: 4 })
     .action(async ({ session }) => {
       if (!session) return
       const count = await library.clearAllJudgeFailures()
       return `已清除 ${count} 条失败记录，将在图片再次出现时重新判断`
     })
   cmd
-    .subcommand('.prune', '手动清理未收藏且超期的记录及其本地图片')
+    .subcommand('.prune', '手动清理未收藏且超期的记录及其本地图片', { authority: 3 })
     .action(async () => {
       const n = await library.pruneStaleOccurrences()
       return `清理完成，共移除 ${n} 条记录及其本地图片`
