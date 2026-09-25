@@ -298,8 +298,13 @@ export class StickerLibrary {
         )
         await this.enforceLibraryLimit()
       } else {
+        // 模型判定不适合收藏：若此前已在收藏库中，需要一并从收藏列表移除
+        const wasCollected = await this.evictFromCollection(pHash)
         await this.releaseJudge(pHash, token, { status: 'rejected' })
-        this.ctx.logger.info(`[sticker] 模型拒绝 ${pHash}`)
+        this.ctx.logger.info(
+          `[sticker] 模型拒绝 ${pHash}` +
+          (wasCollected ? '（已从收藏库移除）' : '（已清理本地文件）')
+        )
       }
     } catch (e: any) {
       const errMsg = String(e?.message ?? e ?? '未知错误')
@@ -435,7 +440,33 @@ export class StickerLibrary {
       })
     }
   }
+  /**
+   * 模型判定为“不适合收藏”时的统一淘汰动作：
+   *   - 删除 sticker_meta 收藏记录（若存在）
+   *   - 删除本地图片文件（若存在）
+   *
+   * 与 enforceLibraryLimit 的区别：这里保留 occurrence 记录为 rejected，
+   * 避免图片再次出现时被反复重新判断。已收藏的被重新判为不合适、
+   * 以及首次判为不合适（此时通常无 meta、仅有刚落的 PNG），都走此路径。
+   *
+   * @returns 是否确实从收藏库移除了一条 sticker_meta
+   */
+  private async evictFromCollection(pHash: string): Promise<boolean> {
+    const meta = await this.ctx.database.get('sticker_meta', { pHash })
+    if (meta.length) {
+      await this.ctx.database.remove('sticker_meta', { pHash })
+    }
+    // removeImageFile 内部吞掉“文件不存在”，首次判定时同样安全
+    await this.removeImageFile(pHash)
 
+    if (meta.length) {
+      this.ctx.logger.info(
+        `[sticker] 重新判定为不合适，已从收藏库移除 ${pHash}` +
+        `（原描述: ${meta[0].description || '无'}）`
+      )
+    }
+    return meta.length > 0
+  }
   // ── 定时清理：未收藏 + lastSeenAt 超期 ────────────────
   /*
    * 已收藏（collected）的记录永不在此处清理，由收藏淘汰逻辑负责。
@@ -470,7 +501,6 @@ export class StickerLibrary {
     )
     return targets.length
   }
-
   // ── 可发送图淘汰（最久未使用优先） ────────────────────
   /**
    * 当已收藏图片（sticker_meta）超过 maxSendableImages 时，
