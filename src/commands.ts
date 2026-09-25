@@ -51,17 +51,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
     })
 
   cmd
-    .subcommand('.show <pHash:string>', '查看指定 pHash 的图片')
-    .action(async ({ session }, pHash) => {
-      if (!session) return
-      const buf = await library.readImage(pHash)
-      if (!buf) return '图片不存在'
-      await session.send(h.image(`data:image/png;base64,${buf.toString('base64')}`))
-      return ''
-    })
-
-  cmd
-    .subcommand('.send <pHash:string>', '手动发送指定表情')
+    .subcommand('.send <pHash:string>', '手动发送指定指定 pHash 的表情')
     .action(async ({ session }, pHash) => {
       if (!session) return
       const buf = await library.readImage(pHash)

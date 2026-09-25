@@ -15,10 +15,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 获取完整历史，有利于 provenance 生成
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24          # 自带 npm 11+，满足 Trusted Publishing 要求
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm
@@ -31,5 +33,5 @@ jobs:
         run: yarn build
 
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --loglevel verbose
         # 不要设置 NODE_AUTH_TOKEN，OIDC 会自动认证
