@@ -431,6 +431,36 @@ export class StickerLibrary {
       .slice(0, limit)
   }
 
+  /**
+   * 从收藏库中随机抽取最多 limit 条作为发送候选池。
+   *
+   * - 收藏总数 ≤ limit：直接返回全部（顺序打乱，避免同一批总是排在前面）
+   * - 收藏总数 > limit：使用部分 Fisher-Yates 洗牌，只随机前 limit 个位置，
+   *   时间复杂度 O(limit)，不整体排序，避免大库时的开销。
+   *
+   * 与 listCollected 的区别：
+   *   listCollected 按 useCount 排序，适合“查看列表”；
+   *   sampleCollected 随机取样，适合“发送时挑一张”，避免高频表情长期霸屏。
+   */
+  async sampleCollected(limit: number) {
+    const rows = await this.ctx.database.get('sticker_meta', {})
+    if (!rows.length) return rows
+
+    const n = Math.min(limit, rows.length)
+    const copy = rows.slice()
+
+    // 部分 Fisher-Yates：只洗前 n 个位置
+    for (let i = 0; i < n; i++) {
+      const j = i + Math.floor(Math.random() * (copy.length - i))
+      if (i !== j) {
+        const tmp = copy[i]
+        copy[i] = copy[j]
+        copy[j] = tmp
+      }
+    }
+
+    return copy.slice(0, n)
+  }
   async markUsed(pHash: string) {
     const rows = await this.ctx.database.get('sticker_meta', { pHash })
     if (rows.length) {

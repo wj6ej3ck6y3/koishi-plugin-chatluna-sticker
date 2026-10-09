@@ -8,7 +8,8 @@ export interface Config {
   phashThreshold: number
   maxSendableImages: number
   occurrenceTtlDays: number
-  judgeTimeoutMinutes: number   // 新增
+  judgeTimeoutMinutes: number
+  sendCandidatePoolSize: number   // 新增
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -39,8 +40,17 @@ export const Config: Schema<Config> = Schema.object({
       '建议设置为大于模型最长响应时间，通常 10 分钟足够。'
     ),
 
-  maxSendableImages: Schema.number().default(10000)
+  maxSendableImages: Schema.number().default(1000)
     .description('本地可发送图片（已收藏状态）的最大数量。超过后按最后使用时间淘汰最久未使用的。'),
   occurrenceTtlDays: Schema.number().default(10)
     .description('未收藏（status 非 collected）的追踪记录及其本地图片，超过此天数未再出现将被自动清理。'),
+  // 新增
+  sendCandidatePoolSize: Schema.number()
+    .default(100)
+    .min(1)
+    .max(1000)
+    .description(
+      '发送表情包时，从收藏库中随机抽取的候选池大小（上限）。' +
+      '候选池越大，越可能命中贴合 intent 的表情，但每次工具调用的打分开销也越大。'
+    ),
 })

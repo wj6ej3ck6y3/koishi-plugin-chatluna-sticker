@@ -22,7 +22,7 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
  * 用 tool() 工厂函数构造工具，避免 StructuredTool 的泛型递归。
  * session 由 Chatluna 在每次调用时注入，闭包捕获即可，不需要全局存储。
  */
-function createStickerSendTool(library: StickerLibrary, _config: Config) {
+function createStickerSendTool(library: StickerLibrary, config: Config) {
   const toolFactory = tool as unknown as (
     fn: (
       input: { intent: string },
@@ -47,7 +47,7 @@ function createStickerSendTool(library: StickerLibrary, _config: Config) {
       }
 
       // 检索候选
-      const candidates = await library.listCollected(20)
+      const candidates = await library.sampleCollected(config.sendCandidatePoolSize)
       if (!candidates.length) {
         return '本地表情库为空，请用文字回复。'
       }
