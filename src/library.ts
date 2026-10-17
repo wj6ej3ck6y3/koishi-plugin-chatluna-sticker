@@ -496,9 +496,8 @@ export class StickerLibrary {
             this.ctx.logger.warn('[sticker] embedding 生成失败:', e)
             return null
           }
-
           // 瞬时断连，静默退避重试，避免刷屏红字
-          await new Promise(resolve => setTimeout(resolve, 150 * (i + 1)))
+          await new Promise(resolve => setTimeout(resolve, 20 * (i + 1)))
         }
       }
       return null
