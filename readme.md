@@ -20,7 +20,7 @@ ChatLuna 扩展插件，让模型自主判断、收藏、发送群聊表情包�
 
 ```bash
 npm install koishi-plugin-chatluna koishi-plugin-chatluna-sticker
-
+```
 ## 常见问题与进阶配置
 
 ### ⚠️ 关于 luna-vdb 的并发冲突
@@ -40,6 +40,7 @@ npm install koishi-plugin-chatluna koishi-plugin-chatluna-sticker
    在控制台插件市场搜索安装，或在终端执行：
    ```bash
    npm install koishi-plugin-isolate-loader
+   ```
 2. **添加并启用插件：**
    在 Koishi 控制台的「插件配置」页面，点击「添加插件」，搜索并添加 isolate-loader。确保该插件处于启用状态（左侧栏显示绿灯）。
 3. **创建独立分组：**
