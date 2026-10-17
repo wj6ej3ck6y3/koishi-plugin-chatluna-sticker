@@ -40,6 +40,7 @@ export class StickerLibrary {
   private judgeSemaphore = new Semaphore(3) // 最多同时判断 3 张图
   private judging = new Set<string>()   // 单进程快速短路
   private embeddingModelRef: any = null
+  private embeddingSemaphore: Semaphore
   private semanticReady = false
   private vdb: LunaVDB | null = null
   private vdbDirty = false
@@ -52,6 +53,7 @@ export class StickerLibrary {
     return vec.map(v => v / norm)
   }
   constructor(private ctx: Context, private config: Config) {
+    this.embeddingSemaphore = new Semaphore(this.config.embeddingConcurrency ?? 3)
     ctx.on('ready', async () => {
       try {
         this.judgeModelRef = await ctx.chatluna.createChatModel(config.judgeModel)
@@ -324,7 +326,16 @@ export class StickerLibrary {
           if (vec) {
             this.addToVDB(pHash, vec)
             hasVec = true
+          } else {
+            // 重判更新了描述但向量生成失败 → 移除旧向量，避免与新描述不一致
+            this.removeFromVDB(pHash)
+            this.ctx.logger.warn(
+              `[sticker] ${pHash} 重判后向量生成失败，已移除旧向量，下次 rebuild-vdb 时补回`
+            )
           }
+        } else if (this.vdb) {
+          // semanticReady = false 但 VDB 中存在旧向量 → 也应清理
+          this.removeFromVDB(pHash)
         }
 
         await this.releaseJudge(pHash, token, { status: 'collected' })
@@ -466,12 +477,15 @@ export class StickerLibrary {
 
   async generateEmbedding(text: string): Promise<number[] | null> {
     if (!this.semanticReady || !this.embeddingModelRef?.value || !text) return null
+    await this.embeddingSemaphore.acquire()
     try {
       const vec = await this.embeddingModelRef.value.embedQuery(text)
       return Array.isArray(vec) && vec.length ? (vec as number[]) : null
     } catch (e) {
       this.ctx.logger.warn('[sticker] embedding 生成失败:', e)
       return null
+    } finally {
+      this.embeddingSemaphore.release()
     }
   }
 
@@ -481,6 +495,7 @@ export class StickerLibrary {
 
   private addToVDB(pHash: string, vector: number[]) {
     if (!this.vdb) return
+    try { this.vdb.remove([pHash]) } catch { }
     const normalized = this.normalize(vector)
     this.vdb.add({ embeddings: [{ id: pHash, embeddings: normalized }] })
     this.markVdbDirty()
@@ -561,15 +576,36 @@ export class StickerLibrary {
     if (!metas.length) return 0
 
     this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
+
     let count = 0
-    for (const m of metas) {
-      const text = this.buildEmbeddingText(m)
-      if (!text) continue
-      const vec = await this.generateEmbedding(text)
-      if (!vec) continue
-      this.vdb.add({ embeddings: [{ id: m.pHash, embeddings: this.normalize(vec) }] })
-      count++
+    // 每批 batchSize 个任务并发提交，batchSize 略大于信号量容量，让信号量保持饱和
+    const concurrency = this.config.embeddingConcurrency ?? 4
+    const batchSize = Math.max(concurrency * 2, 10)
+    let processed = 0
+
+    for (let i = 0; i < metas.length; i += batchSize) {
+      const batch = metas.slice(i, i + batchSize)
+      const results = await Promise.all(
+        batch.map(async m => {
+          const text = this.buildEmbeddingText(m)
+          if (!text) return null
+          const vec = await this.generateEmbedding(text)
+          if (!vec) return null
+          return { pHash: m.pHash, vec: this.normalize(vec) }
+        })
+      )
+      // 写 VDB 是同步的，放主线程顺序 add，避免并发写索引
+      for (const r of results) {
+        if (!r) continue
+        this.vdb.add({ embeddings: [{ id: r.pHash, embeddings: r.vec }] })
+        count++
+      }
+      processed += batch.length
+      this.ctx.logger.info(
+        `[sticker] 向量构建进度: ${processed}/${metas.length}（成功 ${count}）`
+      )
     }
+
     this.vdbDirty = true
     await this.persistVDB()
     this.ctx.logger.info(`[sticker] 向量索引构建完成，共 ${count} 条`)

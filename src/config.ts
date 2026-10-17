@@ -12,6 +12,7 @@ export interface Config {
   // 语义匹配（新增）
   enableSemanticMatch: boolean
   embeddingModel: string
+  embeddingConcurrency: number
   minSemanticSimilarity: number
   debugDistanceProbe: boolean
 }
@@ -69,6 +70,12 @@ export const Config: Schema<Config> = Schema.object({
       '用于生成向量的 Chatluna embedding 模型。' +
       '切换模型后旧向量维度不兼容，插件会依据 sticker_vdb_snapshot.embeddingModel ' +
       '自动判定并重建索引。'
+    ),
+  embeddingConcurrency: Schema.number()
+    .default(3)
+    .min(1)
+    .description(
+      '生成 embedding 时的最大并发数。'
     ),
   minSemanticSimilarity: Schema.number()
     .default(0.3).min(-1).max(1)

@@ -108,7 +108,16 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
   })
   cmd.subcommand('.rebuild-vdb', '重建向量索引', { authority: 4 })
     .action(async () => {
+      if (!config.enableSemanticMatch) {
+        return '语义匹配未启用，无需重建'
+      }
+      if (!config.embeddingModel) {
+        return '未配置 embeddingModel，无法重建'
+      }
       const n = await library.rebuildVDB()
+      if (n === 0) {
+        return '重建完成，但当前收藏库为空（sticker_meta 无记录）'
+      }
       return `已重建，共 ${n} 条向量`
     })
 }
