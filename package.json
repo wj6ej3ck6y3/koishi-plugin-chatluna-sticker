@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-chatluna-sticker",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "type": "commonjs",
@@ -40,13 +40,13 @@
   },
   "peerDependencies": {
     "koishi": "^4.17.0",
-    "koishi-plugin-chatluna": "^1.0.0"
+    "koishi-plugin-chatluna": "^1.4.0"
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",
     "imghash": "^1.0.2",
     "zod": "^3.25.67",
-    "@chatluna/luna-vdb": "^1.4.0"
+    "@chatluna/luna-vdb": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
