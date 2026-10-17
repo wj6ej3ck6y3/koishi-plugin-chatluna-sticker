@@ -3,7 +3,8 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import imghash from 'imghash'
 import { Config } from './config'
-import { StickerOccurrence } from './database'   // 新增
+import { StickerOccurrence, type StickerMeta } from './database'
+import { LunaVDB } from '@chatluna/luna-vdb'
 
 const HASH_BITS = 8           // imghash 网格边长 → 8×8 = 64 bit
 const HASH_LENGTH = 16        // 64-bit = 16 个十六进制字符
@@ -37,8 +38,19 @@ class Semaphore {
 export class StickerLibrary {
   private judgeModelRef: any = null
   private judgeSemaphore = new Semaphore(3) // 最多同时判断 3 张图
-  private judging = new Set<string>()   // 保留：单进程快速短路
-
+  private judging = new Set<string>()   // 单进程快速短路
+  private embeddingModelRef: any = null
+  private semanticReady = false
+  private vdb: LunaVDB | null = null
+  private vdbDirty = false
+  private vdbPersistTimer: (() => void) | null = null
+  private normalize(vec: number[]): number[] {
+    let norm = 0
+    for (const v of vec) norm += v * v
+    norm = Math.sqrt(norm)
+    if (norm === 0) return vec
+    return vec.map(v => v / norm)
+  }
   constructor(private ctx: Context, private config: Config) {
     ctx.on('ready', async () => {
       try {
@@ -50,6 +62,9 @@ export class StickerLibrary {
           `${(e as Error)?.message ?? e}。请确认 judgeModel 配置正确、模型已加载。`
         )
       }
+      // 新增：先建 embedding，再初始化 / 恢复 VDB
+      await this.initEmbedding()
+      await this.initVDB()
       // 崩溃恢复：启动时立即执行一次
       this.recoverStuckJudges().catch(e =>
         ctx.logger.error('[sticker] 恢复超时判断失败:', e)
@@ -66,6 +81,10 @@ export class StickerLibrary {
           ctx.logger.error('[sticker] occurrence 清理失败:', e)
         )
       }, 60 * 60 * 1000)
+      // ↓ 新增：进程退出前尽力落盘 VDB
+      ctx.on('dispose', () => {
+        this.persistVDB().catch(() => { })
+      })
     })
   }
 
@@ -284,17 +303,34 @@ export class StickerLibrary {
       const parsed = this.parseJson(text)
 
       if (parsed.collect) {
+        const desc = String(parsed.description || '')
+        const hint = String(parsed.usageHint || '')
+        const tags = Array.isArray(parsed.tags) ? parsed.tags.map(String) : []
+
         await this.ctx.database.upsert('sticker_meta', [{
           pHash,
-          tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
-          description: String(parsed.description || ''),
-          usageHint: String(parsed.usageHint || ''),
+          tags,
+          description: desc,
+          usageHint: hint,
           useCount: 0,
           collectedAt: Date.now(),
         }])
+        // 新增：生成向量并入库 VDB
+        let hasVec = false
+        if (this.semanticReady && this.vdb) {
+          const vec = await this.generateEmbedding(
+            this.buildEmbeddingText({ description: desc, usageHint: hint, tags })
+          )
+          if (vec) {
+            this.addToVDB(pHash, vec)
+            hasVec = true
+          }
+        }
+
         await this.releaseJudge(pHash, token, { status: 'collected' })
         this.ctx.logger.info(
-          `[sticker] 模型已收藏 ${pHash}: ${parsed.description || '(无描述)'}`
+          `[sticker] 模型已收藏 ${pHash}: ${desc || '(无描述)'}` +
+          (hasVec ? '（已入库向量）' : '（未入库向量）')
         )
         await this.enforceLibraryLimit()
       } else {
@@ -342,6 +378,202 @@ export class StickerLibrary {
       /不支持.{0,10}(图片|图像|多模态)/.test(msg) ||
       /(图片|图像|多模态).{0,10}不支持/.test(msg)
     )
+  }
+
+  // 语义匹配 / luna-vdb
+  private async initEmbedding() {
+    if (!this.config.enableSemanticMatch) {
+      this.ctx.logger.info('[sticker] 语义匹配未启用')
+      return
+    }
+    if (!this.config.embeddingModel) {
+      this.ctx.logger.warn('[sticker] 启用了语义匹配但未配置 embeddingModel，跳过')
+      return
+    }
+    try {
+      this.embeddingModelRef = await this.ctx.chatluna.createEmbeddings(this.config.embeddingModel)
+      this.semanticReady = !!this.embeddingModelRef?.value
+      if (this.semanticReady) {
+        this.ctx.logger.info(`[sticker] Embedding 模型已就绪: ${this.config.embeddingModel}`)
+      } else {
+        this.ctx.logger.error(`[sticker] Embedding 模型引用为空: ${this.config.embeddingModel}`)
+      }
+    } catch (e) {
+      this.ctx.logger.error(
+        `[sticker] 无法创建 Embedding 模型引用（${this.config.embeddingModel}）：` +
+        `${(e as Error)?.message ?? e}`
+      )
+    }
+  }
+
+  // 在 initVDB 成功后调用
+  private detectDistanceSemantics() {
+    const probe = new LunaVDB()
+    try {
+      probe.add({
+        embeddings: [
+          { id: 'self', embeddings: [1, 0, 0] },
+          { id: 'ortho', embeddings: [0, 1, 0] },
+        ]
+      })
+      const r = probe.search(new Float32Array([1, 0, 0]), 2)
+      const self = r.neighbors.find(n => n.id === 'self')?.distance
+      const ortho = r.neighbors.find(n => n.id === 'ortho')?.distance
+      // 期望 self≈0, ortho≈1.414（L2）
+      const isL2 = Math.abs((self ?? 0)) < 0.01
+        && Math.abs((ortho ?? 0) - Math.SQRT2) < 0.01
+      this.ctx.logger.info(
+        `[sticker] luna-vdb 距离语义探测: self=${self}, ortho=${ortho}` +
+        (isL2 ? ' (L2 ✓)' : ' (⚠ 非预期 L2，请检查 score 转换)')
+      )
+    } finally {
+      probe.free()
+    }
+  }
+
+  private async initVDB() {
+    if (!this.semanticReady) {
+      this.ctx.logger.info('[sticker] Embedding 未就绪，跳过 VDB 初始化')
+      return
+    }
+    // 探测 luna-vdb 的 distance 语义（独立临时实例，与 this.vdb 无关）
+    if (this.config.debugDistanceProbe) {
+      this.detectDistanceSemantics()
+    }
+
+    const rows = await this.ctx.database.get('sticker_vdb_snapshot', { id: 'main' })
+    const snap = rows[0]
+
+    if (snap && snap.embeddingModel === this.config.embeddingModel) {
+      try {
+        const buf = Buffer.from(snap.data, 'base64')
+        this.vdb = LunaVDB.deserialize(new Uint8Array(buf))
+        this.ctx.logger.info('[sticker] VDB 已从快照恢复')
+        return
+      } catch (e) {
+        this.ctx.logger.error('[sticker] VDB 快照损坏，将重建:', e)
+      }
+    } else if (snap) {
+      this.ctx.logger.warn(
+        `[sticker] embedding 模型变更（${snap.embeddingModel} → ${this.config.embeddingModel}），` +
+        `旧快照作废，将重建索引`
+      )
+    }
+
+    this.vdb = new LunaVDB()
+    await this.backfillEmbeddings()
+  }
+
+  async generateEmbedding(text: string): Promise<number[] | null> {
+    if (!this.semanticReady || !this.embeddingModelRef?.value || !text) return null
+    try {
+      const vec = await this.embeddingModelRef.value.embedQuery(text)
+      return Array.isArray(vec) && vec.length ? (vec as number[]) : null
+    } catch (e) {
+      this.ctx.logger.warn('[sticker] embedding 生成失败:', e)
+      return null
+    }
+  }
+
+  private buildEmbeddingText(m: { description?: string; usageHint?: string; tags?: string[] }): string {
+    return [m.description || '', m.usageHint || '', ...(m.tags || [])].filter(Boolean).join(' ')
+  }
+
+  private addToVDB(pHash: string, vector: number[]) {
+    if (!this.vdb) return
+    const normalized = this.normalize(vector)
+    this.vdb.add({ embeddings: [{ id: pHash, embeddings: normalized }] })
+    this.markVdbDirty()
+  }
+
+  private removeFromVDB(pHash: string) {
+    if (!this.vdb) return
+    try {
+      this.vdb.remove([pHash])
+      this.markVdbDirty()
+    } catch (e) {
+      this.ctx.logger.warn(`[sticker] VDB 移除 ${pHash} 失败:`, e)
+    }
+  }
+
+  private markVdbDirty() {
+    this.vdbDirty = true
+    if (this.vdbPersistTimer) return
+    this.vdbPersistTimer = this.ctx.setTimeout(async () => {
+      this.vdbPersistTimer = null
+      if (!this.vdbDirty) return
+      await this.persistVDB().catch(e =>
+        this.ctx.logger.error('[sticker] VDB 持久化失败:', e)
+      )
+    }, 5000)
+  }
+
+  private async persistVDB() {
+    if (!this.vdb) return
+    const b64 = Buffer.from(this.vdb.serialize()).toString('base64')
+    await this.ctx.database.upsert('sticker_vdb_snapshot', [{
+      id: 'main',
+      data: b64,
+      embeddingModel: this.config.embeddingModel,
+      updatedAt: Date.now(),
+    }])
+    this.vdbDirty = false
+  }
+
+  async searchBySemantic(
+    intent: string,
+    topK: number,
+    minScore: number
+  ): Promise<Array<{ meta: StickerMeta; score: number }> | null> {
+    if (!this.semanticReady || !this.vdb) return null
+    const queryVec = await this.generateEmbedding(intent)
+    if (!queryVec) return null
+    const normalizedQuery = this.normalize(queryVec)
+
+    const result: any = this.vdb.search(new Float32Array(normalizedQuery), topK)
+    // 已实测 luna-vdb 返回 L2 欧氏距离（self=0, ortho≈√2），
+    // 归一化向量下 cos = 1 - d²/2
+    const neighbors: any[] = result?.neighbors ?? []
+    const hits = neighbors
+      .map((n: any) => {
+        const d = n.distance ?? 0
+        return { pHash: n.id as string, score: 1 - (d * d) / 2 }
+      })
+      .filter((h: any) => h.score >= minScore)
+      .sort((a: any, b: any) => b.score - a.score)
+    if (!hits.length) return []
+
+    const metas = await this.ctx.database.get('sticker_meta', {
+      pHash: { $in: hits.map((h: any) => h.pHash) },
+    })
+    const map = new Map(metas.map(m => [m.pHash, m]))
+    const out: Array<{ meta: StickerMeta; score: number }> = []
+    for (const h of hits) {
+      const m = map.get(h.pHash)
+      if (m) out.push({ meta: m, score: h.score })
+    }
+    return out
+  }
+
+  async backfillEmbeddings(): Promise<number> {
+    if (!this.semanticReady || !this.vdb) return 0
+    const metas = await this.ctx.database.get('sticker_meta', {})
+    if (!metas.length) return 0
+
+    this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
+    let count = 0
+    for (const m of metas) {
+      const text = this.buildEmbeddingText(m)
+      if (!text) continue
+      const vec = await this.generateEmbedding(text)
+      if (!vec) continue
+      this.vdb.add({ embeddings: [{ id: m.pHash, embeddings: this.normalize(vec) }] })
+      count++
+    }
+    this.vdbDirty = true
+    await this.persistVDB()
+    this.ctx.logger.info(`[sticker] 向量索引构建完成，共 ${count} 条`)
+    return count
   }
 
   // ── 手动重试判断 ──────────────────────────────────────
@@ -423,12 +655,19 @@ export class StickerLibrary {
     return failed.length
   }
 
+  //手動重建VDB索引
+  async rebuildVDB(): Promise<number> {
+    if (!this.semanticReady) return 0
+    this.vdb = new LunaVDB()
+    return await this.backfillEmbeddings()
+  }
+
   // ── 已收藏列表 ────────────────────────────────────────
   async listCollected(limit = 20) {
-    const rows = await this.ctx.database.get('sticker_meta', {})
-    return rows
-      .sort((a, b) => (b.useCount || 0) - (a.useCount || 0))
-      .slice(0, limit)
+    return this.ctx.database.get('sticker_meta', {}, {
+      sort: { useCount: 'desc' },
+      limit,
+    })
   }
 
   /**
@@ -485,6 +724,7 @@ export class StickerLibrary {
     const meta = await this.ctx.database.get('sticker_meta', { pHash })
     if (meta.length) {
       await this.ctx.database.remove('sticker_meta', { pHash })
+      this.removeFromVDB(pHash)
     }
     // removeImageFile 内部吞掉“文件不存在”，首次判定时同样安全
     await this.removeImageFile(pHash)
@@ -559,6 +799,7 @@ export class StickerLibrary {
     for (const m of toRemove) {
       await this.ctx.database.remove('sticker_meta', { pHash: m.pHash })
       await this.ctx.database.remove('sticker_occurrence', { pHash: m.pHash })
+      this.removeFromVDB(m.pHash)
       await this.removeImageFile(m.pHash)
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-chatluna-sticker",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "type": "commonjs",
@@ -13,7 +13,7 @@
   "koishi": {
     "description": {
       "en": "Autonomous sticker sending and receiving: local image library, model automatically determines collection, in-memory pHash indexing",
-      "zh": "自主表情包收发：本地图片库、模型自動判断收藏、数据库 pHash 去重"
+      "zh": "自主表情包收发：本地图片库、模型自動判断收藏、数据库 pHash 去重、可选余弦向量匹配语意"
     },
     "service": {
       "required": [
@@ -45,7 +45,8 @@
   "dependencies": {
     "@langchain/core": "^0.3.0",
     "imghash": "^1.0.2",
-    "zod": "^3.25.67"
+    "zod": "^3.25.67",
+    "@chatluna/luna-vdb": "^1.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

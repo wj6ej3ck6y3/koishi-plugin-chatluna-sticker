@@ -5,6 +5,7 @@ import type { RunnableConfig } from '@langchain/core/runnables'
 import { z } from 'zod'
 import { Config } from './config'
 import { StickerLibrary } from './library'
+import type { StickerMeta } from './database'
 
 export function apply(ctx: Context, config: Config, library: StickerLibrary) {
   ctx.chatluna.platform.registerTool('sticker_send', {
@@ -46,32 +47,50 @@ function createStickerSendTool(library: StickerLibrary, config: Config) {
         return '无法获取当前会话，请用文字回复。'
       }
 
-      // 检索候选
-      const candidates = await library.sampleCollected(config.sendCandidatePoolSize)
-      if (!candidates.length) {
-        return '本地表情库为空，请用文字回复。'
+      let picked: StickerMeta | null = null
+      let matchMode = ''
+
+      // 1 语义匹配优先
+      if (config.enableSemanticMatch) {
+        const semantic = await library.searchBySemantic(
+          intent,
+          config.sendCandidatePoolSize,
+          config.minSemanticSimilarity
+        )
+        if (semantic && semantic.length) {
+          picked = semantic[0].meta
+          matchMode = `语义匹配 (score=${semantic[0].score.toFixed(3)})`
+        }
       }
 
-      // 关键词打分：tags / description / usageHint
-      const lowerIntent = intent.toLowerCase()
-      const scored = candidates
-        .map(c => {
-          const hay = [
-            c.description || '',
-            c.usageHint || '',
-            ...(c.tags || []),
-          ]
-            .join(' ')
-            .toLowerCase()
-          let score = 0
-          for (const kw of lowerIntent.split(/[\s,，、]+/)) {
-            if (kw && hay.includes(kw)) score += 1
-          }
-          return { c, score: score * 100 + (c.useCount || 0) }
-        })
-        .sort((a, b) => b.score - a.score)
-
-      const picked = scored[0].c
+      // 2 回退到关键词匹配
+      if (!picked) {
+        // 检索候选
+        const candidates = await library.sampleCollected(config.sendCandidatePoolSize)
+        if (!candidates.length) {
+          return '本地表情库为空，请用文字回复。'
+        }
+        // 关键词打分：tags / description / usageHint
+        const lowerIntent = intent.toLowerCase()
+        const scored = candidates
+          .map(c => {
+            const hay = [
+              c.description || '',
+              c.usageHint || '',
+              ...(c.tags || []),
+            ]
+              .join(' ')
+              .toLowerCase()
+            let score = 0
+            for (const kw of lowerIntent.split(/[\s,，、]+/)) {
+              if (kw && hay.includes(kw)) score += 1
+            }
+            return { c, score: score * 100 + (c.useCount || 0) }
+          })
+          .sort((a, b) => b.score - a.score)
+        picked = scored[0].c
+        matchMode = '关键词匹配'
+      }
 
       // 读取图片字节
       const buf = await library.readImage(picked.pHash)
@@ -82,7 +101,7 @@ function createStickerSendTool(library: StickerLibrary, config: Config) {
       await session.send(h.image(`data:image/png;base64,${buf.toString('base64')}`))
       await library.markUsed(picked.pHash)
 
-      return `已发送表情：${picked.description || picked.pHash}`
+      return `已发送表情（${matchMode}）：${picked.description || picked.pHash}`
     },
     {
       name: 'sticker_send',

@@ -106,4 +106,9 @@ export function apply(ctx: Context, config: Config, library: StickerLibrary) {
       `判断超时: ${config.judgeTimeoutMinutes} 分钟`,   // 新增
     ].join('\n')
   })
+  cmd.subcommand('.rebuild-vdb', '重建向量索引', { authority: 4 })
+    .action(async () => {
+      const n = await library.rebuildVDB()
+      return `已重建，共 ${n} 条向量`
+    })
 }

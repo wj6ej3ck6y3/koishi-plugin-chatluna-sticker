@@ -6,15 +6,13 @@ import * as middleware from './middleware'
 import * as tools from './tools'
 import * as commands from './commands'
 import { StickerLibrary } from './library'
-import { registerJudgeModelSchema } from './model-schema'
+
 
 export const name = 'auto-sticker'
 export const inject = ['database', 'chatluna']
 export { Config }
 
 export function apply(ctx: Context, config: Config) {
-  // 0. 注册动态模型列表（用于 judgeModel 的下拉菜单）
-  registerJudgeModelSchema(ctx)
 
   // 1. 数据库模型
   ctx.plugin(database)
