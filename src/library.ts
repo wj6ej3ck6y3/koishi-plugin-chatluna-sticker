@@ -477,12 +477,30 @@ export class StickerLibrary {
 
   async generateEmbedding(text: string): Promise<number[] | null> {
     if (!this.semanticReady || !this.embeddingModelRef?.value || !text) return null
+
     await this.embeddingSemaphore.acquire()
     try {
-      const vec = await this.embeddingModelRef.value.embedQuery(text)
-      return Array.isArray(vec) && vec.length ? (vec as number[]) : null
-    } catch (e) {
-      this.ctx.logger.warn('[sticker] embedding 生成失败:', e)
+      // 本地推理极快时，undici 连接池复用容易撞上服务端的 FIN 包，
+      // 故意加 20ms 延迟让 Node 事件循环处理完 TCP 关闭信号。
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      for (let i = 0; i <= 2; i++) {
+        try {
+          const vec = await this.embeddingModelRef.value.embedQuery(text)
+          return Array.isArray(vec) && vec.length ? (vec as number[]) : null
+        } catch (e: any) {
+          const msg = String(e?.message ?? e)
+          const isTransient = /ECONNRESET|fetch failed|socket hang up/i.test(msg)
+
+          if (!isTransient || i === 2) {
+            this.ctx.logger.warn('[sticker] embedding 生成失败:', e)
+            return null
+          }
+
+          // 瞬时断连，静默退避重试，避免刷屏红字
+          await new Promise(resolve => setTimeout(resolve, 150 * (i + 1)))
+        }
+      }
       return null
     } finally {
       this.embeddingSemaphore.release()
