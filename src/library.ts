@@ -45,6 +45,8 @@ export class StickerLibrary {
   private vdb: LunaVDB | null = null
   private vdbDirty = false
   private vdbPersistTimer: (() => void) | null = null
+  private vdbSemaphore = new Semaphore(1)   // 新增：串行化所有 VDB 操作
+
   private normalize(vec: number[]): number[] {
     let norm = 0
     for (const v of vec) norm += v * v
@@ -324,18 +326,18 @@ export class StickerLibrary {
             this.buildEmbeddingText({ description: desc, usageHint: hint, tags })
           )
           if (vec) {
-            this.addToVDB(pHash, vec)
+            await this.addToVDB(pHash, vec)
             hasVec = true
           } else {
             // 重判更新了描述但向量生成失败 → 移除旧向量，避免与新描述不一致
-            this.removeFromVDB(pHash)
+            await this.removeFromVDB(pHash)
             this.ctx.logger.warn(
               `[sticker] ${pHash} 重判后向量生成失败，已移除旧向量，下次 rebuild-vdb 时补回`
             )
           }
         } else if (this.vdb) {
           // semanticReady = false 但 VDB 中存在旧向量 → 也应清理
-          this.removeFromVDB(pHash)
+          await this.removeFromVDB(pHash)
         }
 
         await this.releaseJudge(pHash, token, { status: 'collected' })
@@ -471,7 +473,6 @@ export class StickerLibrary {
       )
     }
 
-    this.vdb = new LunaVDB()
     await this.backfillEmbeddings()
   }
 
@@ -510,21 +511,31 @@ export class StickerLibrary {
     return [m.description || '', m.usageHint || '', ...(m.tags || [])].filter(Boolean).join(' ')
   }
 
-  private addToVDB(pHash: string, vector: number[]) {
-    if (!this.vdb) return
-    try { this.vdb.remove([pHash]) } catch { }
-    const normalized = this.normalize(vector)
-    this.vdb.add({ embeddings: [{ id: pHash, embeddings: normalized }] })
-    this.markVdbDirty()
+  private async addToVDB(pHash: string, vector: number[]) {
+    await this.vdbSemaphore.acquire()
+    try {
+      if (!this.vdb) return
+      try { this.vdb.remove([pHash]) } catch { }
+      const normalized = this.normalize(vector)
+      this.vdb.add({ embeddings: [{ id: pHash, embeddings: normalized }] })
+      this.markVdbDirty()
+    } finally {
+      this.vdbSemaphore.release()
+    }
   }
 
-  private removeFromVDB(pHash: string) {
-    if (!this.vdb) return
+  private async removeFromVDB(pHash: string) {
+    await this.vdbSemaphore.acquire()
     try {
-      this.vdb.remove([pHash])
-      this.markVdbDirty()
-    } catch (e) {
-      this.ctx.logger.warn(`[sticker] VDB 移除 ${pHash} 失败:`, e)
+      if (!this.vdb) return
+      try {
+        this.vdb.remove([pHash])
+        this.markVdbDirty()
+      } catch (e) {
+        this.ctx.logger.warn(`[sticker] VDB 移除 ${pHash} 失败:`, e)
+      }
+    } finally {
+      this.vdbSemaphore.release()
     }
   }
 
@@ -540,7 +551,8 @@ export class StickerLibrary {
     }, 5000)
   }
 
-  private async persistVDB() {
+  /** 无锁版本：调用方必须已经持有 vdbSemaphore */
+  private async persistVDBCore() {
     if (!this.vdb) return
     const b64 = Buffer.from(this.vdb.serialize()).toString('base64')
     await this.ctx.database.upsert('sticker_vdb_snapshot', [{
@@ -550,6 +562,16 @@ export class StickerLibrary {
       updatedAt: Date.now(),
     }])
     this.vdbDirty = false
+  }
+
+  /** 加锁包装：供外部（定时器、dispose 等）调用 */
+  private async persistVDB() {
+    await this.vdbSemaphore.acquire()
+    try {
+      await this.persistVDBCore()
+    } finally {
+      this.vdbSemaphore.release()
+    }
   }
 
   async searchBySemantic(
@@ -562,10 +584,17 @@ export class StickerLibrary {
     if (!queryVec) return null
     const normalizedQuery = this.normalize(queryVec)
 
-    const result: any = this.vdb.search(new Float32Array(normalizedQuery), topK)
     // 已实测 luna-vdb 返回 L2 欧氏距离（self=0, ortho≈√2），
     // 归一化向量下 cos = 1 - d²/2
-    const neighbors: any[] = result?.neighbors ?? []
+    let neighbors: any[] = []
+    await this.vdbSemaphore.acquire()
+    try {
+      if (!this.vdb) return null
+      const result: any = this.vdb.search(new Float32Array(normalizedQuery), topK)
+      neighbors = result?.neighbors ?? []
+    } finally {
+      this.vdbSemaphore.release()
+    }
     const hits = neighbors
       .map((n: any) => {
         const d = n.distance ?? 0
@@ -588,43 +617,59 @@ export class StickerLibrary {
   }
 
   async backfillEmbeddings(): Promise<number> {
-    if (!this.semanticReady || !this.vdb) return 0
+    if (!this.semanticReady) return 0
     const metas = await this.ctx.database.get('sticker_meta', {})
     if (!metas.length) return 0
 
-    this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
-
+    // 先在局部实例上构建，全程不碰 this.vdb
+    const newVdb = new LunaVDB()
     let count = 0
-    // 每批 batchSize 个任务并发提交，batchSize 略大于信号量容量，让信号量保持饱和
-    const concurrency = this.config.embeddingConcurrency ?? 4
-    const batchSize = Math.max(concurrency * 2, 10)
-    let processed = 0
 
-    for (let i = 0; i < metas.length; i += batchSize) {
-      const batch = metas.slice(i, i + batchSize)
-      const results = await Promise.all(
-        batch.map(async m => {
-          const text = this.buildEmbeddingText(m)
-          if (!text) return null
-          const vec = await this.generateEmbedding(text)
-          if (!vec) return null
-          return { pHash: m.pHash, vec: this.normalize(vec) }
-        })
-      )
-      // 写 VDB 是同步的，放主线程顺序 add，避免并发写索引
-      for (const r of results) {
-        if (!r) continue
-        this.vdb.add({ embeddings: [{ id: r.pHash, embeddings: r.vec }] })
-        count++
+    
+    
+      this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
+      // 每批 batchSize 个任务并发提交，batchSize 略大于信号量容量，让信号量保持饱和
+      const concurrency = this.config.embeddingConcurrency ?? 3
+      const batchSize = Math.max(concurrency * 2, 10)
+      let processed = 0
+
+      for (let i = 0; i < metas.length; i += batchSize) {
+        const batch = metas.slice(i, i + batchSize)
+        const results = await Promise.all(
+          batch.map(async m => {
+            const text = this.buildEmbeddingText(m)
+            if (!text) return null
+            const vec = await this.generateEmbedding(text)
+            if (!vec) return null
+            return { pHash: m.pHash, vec: this.normalize(vec) }
+          })
+        )
+        // 写 VDB 是同步的，放主线程顺序 add，避免并发写索引
+        for (const r of results) {
+          if (!r) continue
+          newVdb.add({ embeddings: [{ id: r.pHash, embeddings: r.vec }] })
+          count++
+        }
+        processed += batch.length
+        this.ctx.logger.info(
+          `[sticker] 向量构建进度: ${processed}/${metas.length}（成功 ${count}）`
+        )
       }
-      processed += batch.length
-      this.ctx.logger.info(
-        `[sticker] 向量构建进度: ${processed}/${metas.length}（成功 ${count}）`
-      )
+    
+    // 构建完毕，持锁整体替换 + 落盘
+    await this.vdbSemaphore.acquire()
+    try {
+      const old = this.vdb
+      this.vdb = newVdb
+      if (old && typeof (old as any).free === 'function') {
+        try { (old as any).free() } catch { }
+      }
+      this.vdbDirty = true
+      await this.persistVDBCore()   // 注意：核心版，已在锁内
+    } finally {
+      this.vdbSemaphore.release()
     }
 
-    this.vdbDirty = true
-    await this.persistVDB()
     this.ctx.logger.info(`[sticker] 向量索引构建完成，共 ${count} 条`)
     return count
   }
@@ -711,7 +756,6 @@ export class StickerLibrary {
   //手動重建VDB索引
   async rebuildVDB(): Promise<number> {
     if (!this.semanticReady) return 0
-    this.vdb = new LunaVDB()
     return await this.backfillEmbeddings()
   }
 
@@ -777,7 +821,7 @@ export class StickerLibrary {
     const meta = await this.ctx.database.get('sticker_meta', { pHash })
     if (meta.length) {
       await this.ctx.database.remove('sticker_meta', { pHash })
-      this.removeFromVDB(pHash)
+      await this.removeFromVDB(pHash)
     }
     // removeImageFile 内部吞掉“文件不存在”，首次判定时同样安全
     await this.removeImageFile(pHash)
@@ -852,7 +896,7 @@ export class StickerLibrary {
     for (const m of toRemove) {
       await this.ctx.database.remove('sticker_meta', { pHash: m.pHash })
       await this.ctx.database.remove('sticker_occurrence', { pHash: m.pHash })
-      this.removeFromVDB(m.pHash)
+      await this.removeFromVDB(m.pHash)
       await this.removeImageFile(m.pHash)
     }
 
