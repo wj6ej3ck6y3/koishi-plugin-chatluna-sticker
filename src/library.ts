@@ -419,10 +419,23 @@ export class StickerLibrary {
     }
   }
 
-  // 在 initVDB 成功后调用
-  private detectDistanceSemantics() {
-    const probe = new LunaVDB()
+  /**
+  * 探测 luna-vdb 的距离语义。
+  *
+  * 注意：luna-vdb 编译为 WASM，其底层可能是模块级共享的 Rust 状态。
+  * 因此即使 probe 是独立临时实例，创建 / add / search / free 全过程
+  * 也必须持有 vdbSemaphore，避免与 this.vdb 上正在进行的
+  * search / add / remove / serialize 操作交错，触发
+  * "recursive use of an object detected which would lead to unsafe aliasing in rust"。
+  *
+  * 该方法仅在 debugDistanceProbe = true 时执行，纯诊断用途，
+  * 内部吞掉异常，不影响主流程。
+  */
+  private async detectDistanceSemantics() {
+    await this.vdbSemaphore.acquire()
+    let probe: LunaVDB | null = null
     try {
+      probe = new LunaVDB()
       probe.add({
         embeddings: [
           { id: 'self', embeddings: [1, 0, 0] },
@@ -439,8 +452,15 @@ export class StickerLibrary {
         `[sticker] luna-vdb 距离语义探测: self=${self}, ortho=${ortho}` +
         (isL2 ? ' (L2 ✓)' : ' (⚠ 非预期 L2，请检查 score 转换)')
       )
+    } catch (e) {
+      // 探测是诊断用途，失败不应该阻止后续 VDB 初始化
+      this.ctx.logger.warn('[sticker] luna-vdb 距离语义探测失败:', e)
     } finally {
-      probe.free()
+      // free 必须在锁内完成：释放 WASM 资源本身也可能触发借用状态切换
+      if (probe) {
+        try { probe.free() } catch { }
+      }
+      this.vdbSemaphore.release()
     }
   }
 
@@ -451,7 +471,7 @@ export class StickerLibrary {
     }
     // 探测 luna-vdb 的 distance 语义（独立临时实例，与 this.vdb 无关）
     if (this.config.debugDistanceProbe) {
-      this.detectDistanceSemantics()
+      await this.detectDistanceSemantics()
     }
 
     const rows = await this.ctx.database.get('sticker_vdb_snapshot', { id: 'main' })
@@ -512,7 +532,9 @@ export class StickerLibrary {
   }
 
   private async addToVDB(pHash: string, vector: number[]) {
+    this.ctx.logger.debug(`[sticker] addToVDB waiting for lock: ${pHash}`)
     await this.vdbSemaphore.acquire()
+    this.ctx.logger.debug(`[sticker] addToVDB acquired lock: ${pHash}`)
     try {
       if (!this.vdb) return
       try { this.vdb.remove([pHash]) } catch { }
@@ -520,6 +542,7 @@ export class StickerLibrary {
       this.vdb.add({ embeddings: [{ id: pHash, embeddings: normalized }] })
       this.markVdbDirty()
     } finally {
+      this.ctx.logger.debug(`[sticker] addToVDB releasing lock: ${pHash}`)
       this.vdbSemaphore.release()
     }
   }
@@ -621,59 +644,56 @@ export class StickerLibrary {
     const metas = await this.ctx.database.get('sticker_meta', {})
     if (!metas.length) return 0
 
-    // 先在局部实例上构建，全程不碰 this.vdb
-    const newVdb = new LunaVDB()
-    let count = 0
+    // 先在锁外生成所有向量（embedding 调用很慢，不应占锁）
+    const vectors: Array<{ pHash: string; vec: number[] }> = []
+    const concurrency = this.config.embeddingConcurrency ?? 3// 每批 batchSize 个任务并发提交，batchSize 略大于信号量容量，让信号量保持饱和
+    const batchSize = Math.max(concurrency * 2, 10)
 
-    
-    
-      this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
-      // 每批 batchSize 个任务并发提交，batchSize 略大于信号量容量，让信号量保持饱和
-      const concurrency = this.config.embeddingConcurrency ?? 3
-      const batchSize = Math.max(concurrency * 2, 10)
-      let processed = 0
+    this.ctx.logger.info(`[sticker] 开始构建向量索引，共 ${metas.length} 条`)
+    let processed = 0
 
-      for (let i = 0; i < metas.length; i += batchSize) {
-        const batch = metas.slice(i, i + batchSize)
-        const results = await Promise.all(
-          batch.map(async m => {
-            const text = this.buildEmbeddingText(m)
-            if (!text) return null
-            const vec = await this.generateEmbedding(text)
-            if (!vec) return null
-            return { pHash: m.pHash, vec: this.normalize(vec) }
-          })
-        )
-        // 写 VDB 是同步的，放主线程顺序 add，避免并发写索引
-        for (const r of results) {
-          if (!r) continue
-          newVdb.add({ embeddings: [{ id: r.pHash, embeddings: r.vec }] })
-          count++
-        }
-        processed += batch.length
-        this.ctx.logger.info(
-          `[sticker] 向量构建进度: ${processed}/${metas.length}（成功 ${count}）`
-        )
+    for (let i = 0; i < metas.length; i += batchSize) {
+      const batch = metas.slice(i, i + batchSize)
+      const results = await Promise.all(
+        batch.map(async m => {
+          const text = this.buildEmbeddingText(m)
+          if (!text) return null
+          const vec = await this.generateEmbedding(text)
+          if (!vec) return null
+          return { pHash: m.pHash, vec: this.normalize(vec) }
+        })
+      )
+      // 写 VDB 是同步的，放主线程顺序 add，避免并发写索引
+      for (const r of results) {
+        if (r) vectors.push(r)
       }
+      processed += batch.length
+      this.ctx.logger.info(
+        `[sticker] 向量生成进度: ${processed}/${metas.length}（成功 ${vectors.length}）`
+      )
+    }
     
-    // 构建完毕，持锁整体替换 + 落盘
+    // 持锁：销毁旧实例 → 创建新实例 → 写入 → 落盘，全程不释放
     await this.vdbSemaphore.acquire()
     try {
-      const old = this.vdb
-      this.vdb = newVdb
-      if (old && typeof (old as any).free === 'function') {
-        try { (old as any).free() } catch { }
+      // 销毁旧实例（确保 WASM 侧释放借用）
+      if (this.vdb && typeof (this.vdb as any).free === 'function') {
+        try { (this.vdb as any).free() } catch { }
+      }
+      // 创建新实例并立即赋值给 this.vdb，不存在局部 newVdb 与旧实例共存
+      this.vdb = new LunaVDB()
+      for (const r of vectors) {
+        this.vdb.add({ embeddings: [{ id: r.pHash, embeddings: r.vec }] })
       }
       this.vdbDirty = true
-      await this.persistVDBCore()   // 注意：核心版，已在锁内
+      await this.persistVDBCore()
     } finally {
       this.vdbSemaphore.release()
     }
 
-    this.ctx.logger.info(`[sticker] 向量索引构建完成，共 ${count} 条`)
-    return count
+    this.ctx.logger.info(`[sticker] 向量索引构建完成，共 ${vectors.length} 条`)
+    return vectors.length
   }
-
   // ── 手动重试判断 ──────────────────────────────────────
   // 内部读取图片
   async retryJudge(pHash: string): Promise<boolean> {
