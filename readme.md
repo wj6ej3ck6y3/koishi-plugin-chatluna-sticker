@@ -38,11 +38,17 @@ npm install koishi-plugin-chatluna koishi-plugin-chatluna-sticker
 
 1. **安装隔离插件：**
    在控制台插件市场搜索安装，或在终端执行：
+<<<<<<< HEAD
 
     ```bash
     npm install koishi-plugin-isolate-loader
     ```
 
+=======
+   ```bash
+   npm install koishi-plugin-isolate-loader
+   ```
+>>>>>>> 322e49b6f8ba4d26418cbec6f70993731b1c976f
 2. **添加并启用插件：**
    在 Koishi 控制台的「插件配置」页面，点击「添加插件」，搜索并添加 isolate-loader。确保该插件处于启用状态（左侧栏显示绿灯）。
 3. **创建独立分组：**
