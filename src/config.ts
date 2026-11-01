@@ -9,12 +9,15 @@ export interface Config {
   occurrenceTtlDays: number
   judgeTimeoutMinutes: number
   sendCandidatePoolSize: number
-  // 语义匹配（新增）
+  // 语义匹配
   enableSemanticMatch: boolean
   embeddingModel: string
   embeddingConcurrency: number
   minSemanticSimilarity: number
   debugDistanceProbe: boolean
+  // 新增：双工具（先查后发）模式
+  preLLMSelection: boolean
+  preLLMSelectionTopK: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -92,6 +95,18 @@ export const Config: Schema<Config> = Schema.object({
       '发送表情包时，从收藏库中随机抽取的候选池大小（上限）。' +
       '启用语义匹配时，该值同时作为向量检索返回的 top-K。'
     ),
+  preLLMSelection: Schema.boolean()
+    .default(false)
+    .description(
+      '启用后先 sticker_search(intent) 返回 top-K 候选（不发图），' +
+      '模型据此选一张，再调用 sticker_send(pHash) 发送。' +
+      '默认关闭，使用单步直发。'
+    ),
+  preLLMSelectionTopK: Schema.number()
+    .default(5)
+    .min(1)
+    .max(20)
+    .description('sticker_search 返回的候选数量上限，仅 preLLMSelection=true 时生效。'),
   debugDistanceProbe: Schema.boolean()
     .default(false)
     .description(

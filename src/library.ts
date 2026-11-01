@@ -787,6 +787,11 @@ export class StickerLibrary {
     })
   }
 
+  /** 按 pHash 精确查询收藏元数据，供 sticker_send(pHash) 校验使用 */
+  async getMeta(pHash: string): Promise<StickerMeta[]> {
+    return this.ctx.database.get('sticker_meta', { pHash })
+  }
+
   /**
    * 从收藏库中随机抽取最多 limit 条作为发送候选池。
    *
