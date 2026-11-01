@@ -14,7 +14,19 @@ const toolFactory = tool as unknown as (
 ) => unknown
 
 export function apply(ctx: Context, config: Config, library: StickerLibrary) {
-  if (config.preLLMSelection) {
+  // 双步发送（sticker_search → sticker_send(pHash)）仅作为
+  // 未启用余弦向量匹配时的「关键词回退」兜底；
+  // 语义匹配启用时始终走单步直发：向量检索已确定最相关项，
+  // 无需 LLM 再从 top-K 中二次挑选。
+  const useTwoStep = config.preLLMSelection && !config.enableSemanticMatch
+
+  if (config.preLLMSelection && config.enableSemanticMatch) {
+    ctx.logger.info(
+      '[sticker] 语义匹配已启用，忽略 preLLMSelection 配置，使用单步直发'
+    )
+  }
+
+  if (useTwoStep) {
     registerSearchAndSend(ctx, config, library)
   } else {
     registerSingleStepSend(ctx, config, library)
